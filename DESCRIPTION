@@ -1,0 +1,50 @@
+Package: cvm.course.portfolio.dashboard
+Title: CVM Course Portfolio HTML Dashboard
+Version: 0.1.0
+Authors@R:
+    person("Arizona CVM", "AEA", , "aea@arizona.edu", role = c("aut", "cre"))
+Description: Renders self-contained Quarto HTML dashboards (one per course +
+    graduating class, plus a COMBINED dashboard per course across all years)
+    by wrapping the existing CVM course portfolio R packages. Renders are
+    ahead-of-time: data is pulled from Elentra when the render script runs,
+    and the resulting HTML files are static — zero database load at view time.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.2)
+Imports:
+    quarto,
+    plotly,
+    DT,
+    dplyr,
+    readr,
+    purrr,
+    ggplot2,
+    officer,
+    openxlsx,
+    glue,
+    lubridate,
+    scales,
+    tibble,
+    tidyr,
+    jsonlite,
+    htmltools,
+    cli,
+    keyring,
+    pool,
+    DBI,
+    RMariaDB,
+    withr,
+    commonmark,
+    vmh,
+    cvm.gradebook,
+    cvm.course.portfolio,
+    event.curriculum.tags,
+    curriculum.tag.maps,
+    resources,
+    cvm.courseEventFilter,
+    cvm.openAI,
+    cvmverse
+Suggests:
+    renv,
+    getPass

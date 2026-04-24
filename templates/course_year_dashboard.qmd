@@ -1,0 +1,418 @@
+---
+format:
+  dashboard:
+    embed-resources: false
+    theme:
+      - default
+      - lib/custom.scss
+    nav-buttons: []
+    orientation: rows
+params:
+  result_path: ""
+  render_ts: ""
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# Anchor knitr to the project root so subsequent chunks can `source("R/…")`
+# and so params$result_path (an absolute path) resolves cleanly. See
+# render_dashboard.R for why this is set explicitly rather than relied upon.
+proj_root <- normalizePath("..", winslash = "/")
+knitr::opts_knit$set(root.dir = proj_root)
+
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(plotly); library(DT); library(htmltools)
+})
+for (f in c("utils.R", "data_layer.R", "portfolio_runner.R",
+            "comparison_engine.R", "ai_interpret.R", "plot_helpers.R",
+            "html_components.R")) {
+  source(file.path(proj_root, "R", f), local = FALSE)
+}
+
+result <- readRDS(params$result_path)
+render_ts <- if (nzchar(params$render_ts %||% "")) {
+  params$render_ts
+} else {
+  format(Sys.time(), "%Y-%m-%d %H:%M")
+}
+
+grade_ok     <- isTRUE(result$gradebook_ok)
+trend_df     <- if (grade_ok) median_trend(result$grades_df) else tibble::tibble()
+breakdown_df <- assessment_breakdown(result$grades_df)
+```
+
+---
+title: "`r sprintf('%s — %s (%s)', result$course_code, result$course_name, result$cohort_label)`"
+---
+
+# {.sidebar}
+
+```{r}
+ts_names <- if (!is.null(result$tag_coverage) && length(result$tag_coverage) > 0) {
+  pretty_tagset_name(names(result$tag_coverage[[1]] %||% list()))
+} else character(0)
+
+ui_sidebar(
+  course_code = result$course_code,
+  course_name = result$course_name,
+  metadata = c(
+    result$cohort_label,
+    sprintf("%d periods", length(result$periods)),
+    sprintf("Data through %s", format(as.Date(result$use_end_date))),
+    sprintf("Rendered %s", render_ts)
+  ),
+  tagsets = ts_names
+)
+```
+
+# Overview
+
+## Row
+
+```{r}
+#| title: "At a glance"
+tagList(
+  ui_kpi_row(
+    ui_kpi_card(
+      label    = "Overall median",
+      value    = if (grade_ok) sprintf("%.1f", result$kpi$overall_median %||% NA_real_) else "—",
+      subvalue = "Across loaded periods"
+    ),
+    ui_kpi_card(
+      label    = "Students assessed",
+      value    = fmt_num(result$kpi$total_students),
+      subvalue = "Distinct IDs"
+    ),
+    ui_kpi_card(
+      label    = "Periods covered",
+      value    = fmt_num(result$kpi$periods_covered)
+    ),
+    ui_kpi_card(
+      label    = "Tag sets",
+      value    = fmt_num(result$kpi$n_tag_sets),
+      subvalue = sprintf("Across %d period%s with tag data",
+                         result$kpi$periods_with_tags %||% 0L,
+                         if ((result$kpi$periods_with_tags %||% 0L) == 1) "" else "s")
+    )
+  ),
+  if (!grade_ok) {
+    HTML(paste0(
+      '<div class="cvm-banner warn"><strong>Gradebook data unavailable.</strong> ',
+      'Assessment plots will show placeholders. Curriculum tag coverage ',
+      'and cross-year comparisons are unaffected.</div>'
+    ))
+  } else {
+    HTML(paste0(
+      '<div class="cvm-banner success">',
+      sprintf('Data loaded successfully — %d students across %d periods.',
+              result$kpi$total_students %||% 0,
+              result$kpi$periods_covered %||% 0),
+      '</div>'
+    ))
+  }
+)
+```
+
+# Assessment Performance
+
+## Row
+
+```{r}
+#| title: "Median grade trend (interactive)"
+tagList(
+  ui_section_header("Trend across periods"),
+  if (nrow(trend_df) == 0) {
+    tags$p(style = "color:#5A6472; padding:24px;",
+           "No trend data available for this class.")
+  } else {
+    trend_plotly(trend_df, title = sprintf("Median grade trend — %s", result$course_code))
+  }
+)
+```
+
+```{r}
+#| title: "Median by assessment"
+if (!is.null(result$assessment_plots) && !is.null(result$assessment_plots$median)) {
+  tagList(
+    ui_section_header("From the original portfolio pipeline"),
+    plotly::ggplotly(result$assessment_plots$median) |>
+      plotly::config(displaylogo = FALSE)
+  )
+} else {
+  tags$p(style = "color:#5A6472; padding:24px;",
+         "Median grade plot not available.")
+}
+```
+
+## Row
+
+```{r}
+#| title: "Counts below 70% / 80% / 90%"
+if (!is.null(result$assessment_plots) && !is.null(result$assessment_plots$pct)) {
+  tagList(
+    ui_section_header("Percentile thresholds"),
+    plotly::ggplotly(result$assessment_plots$pct) |>
+      plotly::config(displaylogo = FALSE)
+  )
+} else {
+  tags$p(style = "color:#5A6472; padding:24px;",
+         "Percentile plot not available.")
+}
+```
+
+```{r}
+#| title: "Grade distribution by period"
+# IMPORTANT: distribution_plot() returns a bare ggplot. htmltools::tagList
+# cannot coerce ggplot2's S7 objects (typeof == "object") and throws
+# "cannot coerce type 'object' to vector of type 'character'". We convert
+# via ggplotly() so the child is an htmlwidget that htmltools understands.
+# As a bonus the histogram becomes interactive, matching the sibling plots.
+tagList(
+  ui_section_header("Distribution of individual scores"),
+  if (grade_ok && nrow(result$grades_df) > 0) {
+    plotly::ggplotly(distribution_plot(result$grades_df)) |>
+      plotly::config(displaylogo = FALSE)
+  } else {
+    tags$p(style = "color:#5A6472; padding:24px;", "No grade data available.")
+  }
+)
+```
+
+## Row
+
+```{r}
+#| title: "Assessment breakdown"
+tagList(
+  ui_section_header("Per-assessment statistics"),
+  DT::datatable(
+    breakdown_df,
+    rownames   = FALSE,
+    extensions = "Buttons",
+    options    = list(dom = "Bfrtip", buttons = c("csv", "excel"),
+                      pageLength = 15, scrollX = TRUE)
+  ) |>
+    DT::formatRound(columns = c("mean", "median", "sd"), digits = 2)
+)
+```
+
+# Curriculum Tag Coverage
+
+```{r}
+#| output: asis
+# Emission strategy (see ALSO course_combined_dashboard.qmd):
+#
+# Inside an `output: asis` chunk, custom htmltools components (spans with
+# inline styles, divs, chips, etc.) need to reach pandoc as RAW HTML. If we
+# print(tag) the way print.shiny.tag does, pandoc re-parses the spans as
+# markdown inline text and we see literal "<span style=...>" show up on the
+# page. The bulletproof pandoc-native fix is to wrap every bare-tag emission
+# in a `{=html}` raw-HTML fence — pandoc preserves whatever's between the
+# fences verbatim, no re-parsing.
+#
+# Plotly/DT widgets continue to use print(); their knit_print methods handle
+# dependency registration correctly and are NOT affected by this issue.
+emit_html <- function(tag) {
+  if (is.null(tag)) return(invisible())
+  cat("\n```{=html}\n", as.character(tag), "\n```\n\n", sep = "")
+}
+
+tc <- result$tag_coverage
+first_period_tc <- if (!is.null(tc) && length(tc) > 0) tc[[1]] else NULL
+
+if (is.null(first_period_tc) || length(first_period_tc) == 0) {
+  emit_html(HTML('<div class="cvm-banner info">No tag coverage data available for this course.</div>'))
+} else {
+  cat("## {.tabset}\n\n")
+  for (ts in names(first_period_tc)) {
+    pretty <- pretty_tagset_name(ts)
+    cat(sprintf("### %s\n\n", pretty))
+
+    dfs    <- lapply(tc, function(x) x[[ts]])
+    merged <- dplyr::bind_rows(Filter(Negate(is.null), dfs))
+    s      <- tag_coverage_summary(merged)
+    bar    <- tag_bar_plotly(merged, title = pretty)
+
+    # Coverage hero strip — bare htmltools, fence-wrapped.
+    emit_html(ui_coverage_strip(
+      covered = s$covered,
+      total   = s$total,
+      pct     = s$pct,
+      label   = sprintf("%s covered", tolower(pretty))
+    ))
+
+    # Original cvm.course.portfolio coverage chart — widget, plain print().
+    if (!is.null(result$tagset_plots[[ts]])) {
+      emit_html(ui_section_header("Coverage chart"))
+      print(plotly::ggplotly(result$tagset_plots[[ts]]) |>
+              plotly::config(displaylogo = FALSE))
+    }
+
+    # Tag-by-tag bar chart — widget.
+    emit_html(ui_section_header("Tag-by-tag counts"))
+    print(bar$plot)
+
+    # Deprecated-tags note — bare.
+    emit_html(ui_deprecated_note(bar$deprecated_count))
+
+    # Uncovered tag chips — bare.
+    emit_html(ui_section_header(sprintf("Uncovered tags (%d)", length(s$uncovered))))
+    emit_html(ui_tag_chips(s$uncovered))
+  }
+}
+```
+
+# Course Insights
+
+```{r}
+narr_path <- sub("\\.rds$", "_narrative.rds", params$result_path)
+narrative <- if (file.exists(narr_path)) readRDS(narr_path) else NULL
+
+if (is.null(narrative)) {
+  HTML('<div class="cvm-banner info">Narrative not available for this render.</div>')
+} else if (isFALSE(narrative$available %||% TRUE)) {
+  HTML(paste0(
+    '<div class="cvm-narrative"><h3>Course narrative not available</h3><p>',
+    htmlEscape(narrative$narrative),
+    '</p></div>'
+  ))
+} else {
+  flags_ui <- if (!is.null(narrative$flags) && nrow(narrative$flags) > 0) {
+    tagList(lapply(seq_len(nrow(narrative$flags)), function(i) {
+      f <- narrative$flags[i, ]
+      klass <- switch(f$severity,
+                      high   = "cvm-flag red",
+                      medium = "cvm-flag amber",
+                      low    = "cvm-flag green",
+                      "cvm-flag amber")
+      tags$div(class = klass,
+        tags$div(
+          tags$div(class = "label", toupper(f$severity)),
+          tags$div(class = "issue", f$issue),
+          tags$div(class = "rec",   f$recommendation)
+        )
+      )
+    }))
+  } else NULL
+
+  questions_ui <- if (length(narrative$questions) > 0) {
+    tags$ol(class = "cvm-questions",
+            lapply(narrative$questions, tags$li))
+  } else NULL
+
+  tagList(
+    tags$div(class = "cvm-narrative", HTML(markdown_to_html(narrative$narrative))),
+    if (!is.null(flags_ui))     tagList(ui_section_header("Areas of concern"),   flags_ui),
+    if (!is.null(questions_ui)) tagList(ui_section_header("Questions to explore"), questions_ui),
+    tags$p(
+      style = "color:#5A6472; font-size:12px; margin-top:24px;",
+      sprintf("Generated %s using %s.",
+              fmt_ts(narrative$generated_at),
+              narrative$model %||% "—")
+    )
+  )
+}
+```
+
+# Downloads
+
+```{r}
+# params$result_path points at {course_dir}/.render_cache/{tag}_result.rds.
+# The PPTX / zipped workbooks live one level up, in the course folder itself.
+course_dir <- dirname(dirname(params$result_path))
+
+# --- Export artifacts (PPTX, Excel zip) generated by --with-exports ---------
+pptx_files <- list.files(course_dir, pattern = "\\.pptx$",          full.names = TRUE)
+xlsx_files <- list.files(course_dir, pattern = "_workbooks\\.zip$", full.names = TRUE)
+
+download_row <- function(label, abs_path, href_rel) {
+  if (!file.exists(abs_path)) return(NULL)
+  size <- fmt_bytes(file.info(abs_path)$size)
+  tags$div(
+    class = "cvm-download",
+    tags$div(class = "label", label),
+    tags$a(href = href_rel, target = "_blank", basename(abs_path),
+           download = basename(abs_path)),
+    tags$span(class = "size", size)
+  )
+}
+
+export_items <- tagList(
+  if (length(pptx_files) > 0) download_row("PowerPoint",
+                                           pptx_files[[1]],
+                                           basename(pptx_files[[1]])),
+  if (length(xlsx_files) > 0) download_row("Excel workbooks (zip)",
+                                           xlsx_files[[1]],
+                                           basename(xlsx_files[[1]]))
+)
+has_exports <- length(pptx_files) > 0 || length(xlsx_files) > 0
+
+exports_block <- tagList(
+  ui_section_header("Export artifacts"),
+  if (has_exports) {
+    tags$div(class = "cvm-downloads", export_items)
+  } else {
+    HTML('<div class="cvm-banner info">No export files found. Re-run <code>render_dashboard.R</code> with <code>--with-exports</code> to generate the PowerPoint and Excel workbooks.</div>')
+  }
+)
+
+# --- Course surveys ---------------------------------------------------------
+# surveys_dir returns outputs/{course_code}_{class_slug}/surveys/, which is
+# a different parent folder from course_dir (see R/utils.R for the rationale).
+# Compute a relative path from this HTML's location to that folder so the
+# <a href=…> links work whether the dashboards are served from disk or Box.
+s_dir_abs <- surveys_dir(result$course_code, result$cohort_label)
+
+# Relative hop from course_dir -> surveys folder: up one level, then into
+# "{safe_code}_{class_slug}/surveys/".
+safe_code <- gsub("[^A-Za-z0-9]", "", result$course_code)
+class_slug_local <- cohort_slug(result$cohort_label)
+surveys_rel_base <- file.path("..", sprintf("%s_%s", safe_code, class_slug_local), "surveys")
+
+surveys_block <- if (!dir.exists(s_dir_abs)) {
+  # Folder not yet created — tell the viewer when it will be.
+  ready_on <- if (!is.null(result$max_period_finish_date) &&
+                  !is.na(result$max_period_finish_date)) {
+    format(as.Date(result$max_period_finish_date) + 2)
+  } else {
+    "(period end date unknown)"
+  }
+  tagList(
+    ui_section_header("Course surveys"),
+    HTML(sprintf(
+      '<div class="cvm-banner info">Survey folder will be created 2 days after course end (%s).</div>',
+      ready_on
+    ))
+  )
+} else {
+  pdfs <- list.files(s_dir_abs, pattern = "\\.pdf$", full.names = TRUE)
+  if (length(pdfs) == 0) {
+    tagList(
+      ui_section_header("Course surveys"),
+      HTML(sprintf(
+        '<div class="cvm-banner info">Survey folder ready — drop PDF files here to make them available for download: <code>%s</code></div>',
+        htmlEscape(sub("^.*/outputs/", "outputs/", s_dir_abs))
+      ))
+    )
+  } else {
+    rows <- lapply(pdfs, function(p) {
+      download_row(
+        label    = "Survey PDF",
+        abs_path = p,
+        href_rel = file.path(surveys_rel_base, basename(p))
+      )
+    })
+    tagList(
+      ui_section_header("Course surveys"),
+      tags$div(class = "cvm-downloads", do.call(tagList, rows))
+    )
+  }
+}
+
+tagList(exports_block, surveys_block)
+```

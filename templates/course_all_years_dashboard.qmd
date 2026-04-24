@@ -1,0 +1,1858 @@
+---
+format:
+  dashboard:
+    embed-resources: false
+    theme:
+      - default
+      - lib/custom.scss
+    nav-buttons: []
+    orientation: rows
+params:
+  all_data_path: ""
+  cohort_colors_json: ""
+  period_index_json: ""
+  render_ts: ""
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# Anchor knitr to project root (Quarto otherwise runs chunks from templates/).
+proj_root <- normalizePath("..", winslash = "/")
+knitr::opts_knit$set(root.dir = proj_root)
+
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(plotly); library(DT); library(htmltools)
+  library(jsonlite)
+})
+for (f in c("utils.R", "data_layer.R", "portfolio_runner.R",
+            "comparison_engine.R", "ai_interpret.R",
+            "plot_helpers.R", "html_components.R")) {
+  source(file.path(proj_root, "R", f), local = FALSE)
+}
+
+# ---- payload read ---------------------------------------------------------
+all_data <- readRDS(params$all_data_path)
+all_data <- Filter(function(r) !is.null(r) && length(r$periods) > 0, all_data)
+stopifnot(length(all_data) >= 1)
+
+# cohort_colors as a named character vector (source of truth, parsed from
+# render_dashboard.R's computed assignment — do NOT recompute here).
+cohort_colors <- jsonlite::fromJSON(params$cohort_colors_json, simplifyVector = TRUE)
+if (!is.character(cohort_colors) || length(cohort_colors) == 0) {
+  # Defensive fallback: compute from labels if caller forgot to pass.
+  cohort_colors <- assign_cohort_colors(vapply(all_data, function(r) r$cohort_label, character(1)))
+}
+
+period_index_json <- params$period_index_json
+cohort_colors_json <- params$cohort_colors_json
+
+primary   <- all_data[[length(all_data)]]
+render_ts <- if (nzchar(params$render_ts %||% "")) {
+  params$render_ts
+} else {
+  format(Sys.time(), "%Y-%m-%d %H:%M")
+}
+
+# Ensure all_data is keyed by cohort_label so per-cohort lookups stay clean.
+names(all_data) <- vapply(all_data, function(r) r$cohort_label, character(1))
+
+# ---- helpers scoped to this template --------------------------------------
+# cohort_color_for: safe lookup that falls through to navy if missing.
+cohort_color_for <- function(cohort_label) {
+  col <- cohort_colors[[cohort_label]]
+  if (is.null(col) || is.na(col) || !nzchar(col)) CVM_PALETTE$navy else col
+}
+# Raw-HTML fence helper — same pattern as other templates; required so
+# pandoc does not re-parse inline <span> tags as markdown text.
+emit_html <- function(tag) {
+  if (is.null(tag)) return(invisible())
+  cat("\n```{=html}\n", as.character(tag), "\n```\n\n", sep = "")
+}
+
+# ---- overview scalars ------------------------------------------------------
+overall_medians <- vapply(all_data, function(r) r$kpi$overall_median %||% NA_real_, numeric(1))
+total_students  <- sum(vapply(all_data, function(r) r$kpi$total_students  %||% 0L, integer(1)))
+total_periods   <- sum(vapply(all_data, function(r) r$kpi$periods_covered %||% 0L, integer(1)))
+n_tag_sets_max  <- max(vapply(all_data, function(r) r$kpi$n_tag_sets %||% 0L, integer(1)), 0L)
+
+# ---- per-cohort precomputed frames (used by Assessment Performance tab) ----
+cohort_trends <- lapply(all_data, function(r) {
+  if (!isTRUE(r$gradebook_ok)) return(NULL)
+  median_trend(r$grades_df)
+})
+
+# cohort_thresholds: count of students with <70%, <80%, <90% final grade.
+# Shape: tibble(threshold = <chr>, count = <int>)
+thresholds_from_gb <- function(gb) {
+  final <- gb |>
+    dplyr::filter(.data$assessment %in% c("weighted_overall_grade",
+                                          "individual_weighted_overall"))
+  if (nrow(final) == 0) final <- gb
+  g <- final$grade
+  tibble::tibble(
+    threshold = c("< 70%", "< 80%", "< 90%"),
+    count     = c(sum(g < 70, na.rm = TRUE),
+                  sum(g < 80, na.rm = TRUE),
+                  sum(g < 90, na.rm = TRUE))
+  )
+}
+cohort_thresholds <- lapply(all_data, function(r) {
+  if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) || nrow(r$grades_df) == 0) return(NULL)
+  thresholds_from_gb(r$grades_df)
+})
+
+# period_labels: "34" -> "GC26 · Fall Y1". Drives readable x-axis ticks on the
+# trend chart. Built from build_period_index() which already does this work.
+pi <- build_period_index(all_data)
+period_labels <- stats::setNames(
+  vapply(pi, function(p) as.character(p$label), character(1)),
+  vapply(pi, function(p) as.character(p$cperiod_id), character(1))
+)
+
+# cohort_stats: per-cohort summary rows below the trend chart.
+cohort_stats <- dplyr::bind_rows(lapply(names(all_data), function(lab) {
+  r <- all_data[[lab]]
+  if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) || nrow(r$grades_df) == 0) {
+    return(tibble::tibble(
+      Cohort = lab, Median = NA_real_, Mean = NA_real_,
+      SD = NA_real_, Min = NA_real_, Max = NA_real_,
+      N = 0L, `% ≥ 90` = NA_real_, `% ≥ 80` = NA_real_,
+      .rows = 1
+    ))
+  }
+  # Use the final-grade assessments where available; fall back to all rows.
+  final <- r$grades_df |>
+    dplyr::filter(.data$assessment %in% c("weighted_overall_grade",
+                                          "individual_weighted_overall"))
+  df <- if (nrow(final) > 0) final else r$grades_df
+  g <- df$grade[!is.na(df$grade)]
+  tibble::tibble(
+    Cohort   = lab,
+    Median   = stats::median(g),
+    Mean     = mean(g),
+    SD       = stats::sd(g),
+    Min      = min(g),
+    Max      = max(g),
+    N        = dplyr::n_distinct(df$id),
+    `% ≥ 90` = 100 * mean(g >= 90),
+    `% ≥ 80` = 100 * mean(g >= 80)
+  )
+}))
+
+# cohorts_with_data: keep the order of names(all_data) but drop any that have
+# no gradebook — used by the histogram grid below so we don't render empty
+# panels.
+cohorts_with_data <- Filter(function(lab) {
+  r <- all_data[[lab]]
+  isTRUE(r$gradebook_ok) && !is.null(r$grades_df) && nrow(r$grades_df) > 0
+}, names(all_data))
+
+# cohort_breakdown_df: single long table for the breakdown DT — one row per
+# assessment × cohort × period.
+cohort_breakdown_df <- dplyr::bind_rows(
+  lapply(names(all_data), function(lab) {
+    r <- all_data[[lab]]
+    if (is.null(r$grades_df) || nrow(r$grades_df) == 0) return(NULL)
+    bd <- assessment_breakdown(r$grades_df)
+    if (nrow(bd) == 0) return(NULL)
+    bd$cohort <- lab
+    bd$cohort_color <- unname(cohort_colors[[lab]])
+    bd
+  })
+)
+
+# Tag-sets available are derived from the primary (latest) cohort's coverage.
+tag_set_names <- if (!is.null(primary$tag_coverage) && length(primary$tag_coverage) > 0) {
+  names(primary$tag_coverage[[1]] %||% list())
+} else character(0)
+
+# Chip list order for sidebar display (pretty names).
+tag_set_pretty <- if (length(tag_set_names) > 0) pretty_tagset_name(tag_set_names) else character(0)
+```
+
+---
+title: "`r sprintf('%s — %s (All years)', primary$course_code, primary$course_name)`"
+---
+
+# {.sidebar}
+
+```{r}
+ui_sidebar(
+  course_code = primary$course_code,
+  course_name = primary$course_name,
+  metadata = c(
+    sprintf("All-years view — %d cohort%s",
+            length(all_data),
+            if (length(all_data) == 1) "" else "s"),
+    sprintf("%d periods total", total_periods),
+    sprintf("Rendered %s", render_ts)
+  ),
+  extra_sections = list(
+    list(title = "Classes included",
+         items = vapply(all_data, function(r) r$cohort_label, character(1))),
+    list(title = "Tag sets available",
+         items = tag_set_pretty)
+  )
+)
+```
+
+# Overview
+
+## Row
+
+```{r}
+#| title: "Portfolio at a glance"
+# KPI cards carry data-kpi hooks so the filter JS can recompute on chip
+# toggle. Initial values reflect ALL cohorts selected.
+tagList(
+  ui_kpi_row(
+    ui_kpi_card(
+      label    = "Pooled median grade (%)",
+      value    = if (any(!is.na(overall_medians))) sprintf("%.1f", median(overall_medians, na.rm = TRUE)) else "—",
+      subvalue = "Across selected cohorts",
+      kpi_key  = "median"
+    ),
+    ui_kpi_card(
+      label    = "Total students assessed",
+      value    = fmt_num(total_students),
+      subvalue = "Summed across selected cohorts",
+      kpi_key  = "students"
+    ),
+    ui_kpi_card(
+      label    = "Curriculum periods covered",
+      value    = fmt_num(total_periods),
+      kpi_key  = "periods"
+    ),
+    ui_kpi_card(
+      label    = "Curriculum tag sets",
+      value    = fmt_num(n_tag_sets_max),
+      subvalue = "Distinct curriculum tag sets",
+      kpi_key  = "tag_sets",
+      size     = "sm"
+    )
+  )
+)
+```
+
+```{r}
+#| title: "Cohort summary"
+# One row per cohort: colored dot + label + individual median / students.
+rows <- lapply(names(all_data), function(lab) {
+  r <- all_data[[lab]]
+  col <- cohort_color_for(lab)
+  # Pull per-cohort stats we already computed in the setup chunk — keeps a
+  # single source of truth with the Assessment Performance stats card.
+  stat <- cohort_stats[cohort_stats$Cohort == lab, , drop = FALSE]
+  take_num <- function(col_name) {
+    if (nrow(stat) == 0) return(NA_real_)
+    v <- stat[[col_name]]
+    if (length(v) == 0 || !is.finite(v[[1]])) NA_real_ else round(as.numeric(v[[1]]), 1)
+  }
+  data.frame(
+    Cohort       = lab,
+    Color        = col,
+    Median       = take_num("Median"),
+    Mean         = take_num("Mean"),
+    SD           = take_num("SD"),
+    Min          = take_num("Min"),
+    Max          = take_num("Max"),
+    `N Students` = as.integer(r$kpi$total_students  %||% 0L),
+    `% ≥ 90`     = take_num("% ≥ 90"),
+    `% ≥ 80`     = take_num("% ≥ 80"),
+    Periods      = as.integer(r$kpi$periods_covered %||% 0L),
+    `Tag Sets`   = as.integer(r$kpi$n_tag_sets       %||% 0L),
+    check.names  = FALSE,
+    stringsAsFactors = FALSE
+  )
+})
+summary_df <- do.call(rbind, rows)
+# Cohort cell = colored dot + label. The containing <tr> is NOT wrapped in
+# .cvm-filterable (DT rebuilds rows dynamically, and hiding rows via the
+# filter JS would break DT's rendering). The chip filter bar drives the OTHER
+# per-cohort cards and charts; this summary table intentionally always shows
+# every cohort so the cross-cohort comparison stays visible.
+summary_df$Cohort <- mapply(function(lab, col) {
+  sprintf('<span style="display:inline-block;width:10px;height:10px;border-radius:50%%;background:%s;margin-right:8px;vertical-align:middle;"></span>%s',
+          col, htmlEscape(lab))
+}, summary_df$Cohort, summary_df$Color, USE.NAMES = FALSE)
+summary_df$Color <- NULL
+
+# Spec-ordered columns: Cohort, Median, Mean, SD, Min, Max, N Students,
+# % ≥ 90, % ≥ 80, Periods, Tag Sets.
+summary_df <- summary_df[, c("Cohort", "Median", "Mean", "SD", "Min", "Max",
+                             "N Students", "% ≥ 90", "% ≥ 80",
+                             "Periods", "Tag Sets"), drop = FALSE]
+
+numeric_cols <- c("Median", "Mean", "SD", "Min", "Max",
+                  "N Students", "% ≥ 90", "% ≥ 80", "Periods", "Tag Sets")
+numeric_col_idx0 <- which(names(summary_df) %in% numeric_cols) - 1L
+
+DT::datatable(
+  summary_df,
+  rownames = FALSE,
+  escape   = FALSE,
+  options  = list(
+    dom = "t", pageLength = 20, ordering = FALSE, scrollX = FALSE,
+    columnDefs = list(
+      list(targets = 0, className = "dt-left"),
+      list(targets = numeric_col_idx0, className = "dt-right")
+    ),
+    initComplete = DT::JS(
+      "function(settings, json) {",
+      "  $(this.api().table().header()).find('th').css({",
+      "    'background-color': '#003F6B',",
+      "    'color':            '#FFFFFF',",
+      "    'font-weight':      '600',",
+      "    'border-bottom':    '3px solid #AB8B00'",
+      "  });",
+      "}"
+    )
+  )
+) |>
+  # All numeric columns to 1 decimal (integer counts like N/Periods/Tag Sets
+  # are stored as integers and display without decimals via DT's int path).
+  DT::formatRound(columns = c("Median", "Mean", "SD", "Min", "Max",
+                              "% ≥ 90", "% ≥ 80"), digits = 1)
+```
+
+# Assessment Performance
+
+## Row
+
+```{r}
+# Assessment Performance — redesigned as five vertically stacked full-width
+# sections. Each section has a navy 18px bold heading, a one-line muted
+# description, 32px vertical padding, and is separated from the next by a
+# 1px #E8ECF0 hr divider. The earlier chunk-isolation-per-widget
+# requirement was only needed because of the `styleEqual(NULL, NULL)` /
+# `onRender` bugs (both since removed), so all five widgets now live in a
+# single tagList for a cleaner presentation flow.
+
+section_head <- function(title, desc) {
+  tagList(
+    tags$h2(class = "cvm-card-title", title),
+    tags$p(class  = "cvm-card-desc",  desc)
+  )
+}
+
+# ── Section 1: Grade Performance by Cohort ──────────────────────────────
+s1_widget <- if (nrow(cohort_stats) == 0) {
+  ui_banner("No gradebook data available for any cohort.", variant = "info")
+} else {
+  stats_df <- cohort_stats
+  stats_df$Cohort <- vapply(stats_df$Cohort, function(lab) {
+    col <- cohort_color_for(lab)
+    sprintf('<span style="display:inline-block;width:10px;height:10px;border-radius:50%%;background:%s;margin-right:8px;vertical-align:middle;"></span>%s',
+            col, htmlEscape(lab))
+  }, character(1))
+
+  numeric_cols_0idx <- which(!names(stats_df) %in% "Cohort") - 1L
+  DT::datatable(
+    stats_df, rownames = FALSE, escape = FALSE,
+    options = list(
+      dom = "t", pageLength = 20, scrollX = FALSE, ordering = FALSE,
+      columnDefs = list(
+        list(targets = numeric_cols_0idx, className = "dt-right"),
+        list(targets = 0, width = "200px")
+      ),
+      rowCallback = DT::JS(
+        "function(row, data, dispIndex) {",
+        "  if (dispIndex % 2 === 1) { $(row).css('background-color', '#F9FAFB'); }",
+        "}"
+      ),
+      initComplete = DT::JS(
+        "function(settings, json) {",
+        "  $(this.api().table().header()).find('th').css({",
+        "    'background-color': '#003F6B',",
+        "    'color':            '#FFFFFF',",
+        "    'font-weight':      '600'",
+        "  });",
+        "}"
+      )
+    )
+  ) |>
+    DT::formatRound(columns = c("Median", "Mean", "SD", "Min", "Max",
+                                "% ≥ 90", "% ≥ 80"), digits = 1)
+}
+
+# ── Section 2: Grade Distribution by Cohort ─────────────────────────────
+s2_widget <- if (length(cohorts_with_data) == 0) {
+  ui_banner("No gradebook data available for any cohort.", variant = "info")
+} else {
+  tags$div(
+    # Fix 1: fixed 3-column grid at 360px rows — see .cvm-histogram-grid
+    # rule in the <style> block. No auto-fit / no minmax — overlap-proof.
+    class = "cvm-histogram-grid",
+    lapply(cohorts_with_data, function(lab) {
+      r <- all_data[[lab]]
+      col <- cohort_color_for(lab)
+      tags$div(
+        class = "cvm-filterable cvm-histogram-card",
+        `data-cohort-labels` = lab,
+        style = "background:#fff;border:1px solid #E0E4EC;border-radius:12px;padding:16px;position:relative;height:360px;overflow:hidden;",
+        tags$div(
+          style = "display:flex;align-items:center;gap:8px;margin-bottom:8px;",
+          tags$span(style = sprintf(
+            "display:inline-block;width:12px;height:12px;border-radius:50%%;background:%s;",
+            col)),
+          tags$span(style = sprintf(
+            "font-size:13px;font-weight:600;color:%s;", col),
+            lab)
+        ),
+        ui_plot_box(
+          plotly::ggplotly(
+            distribution_plot(r$grades_df,
+                              title = sprintf("Distribution — %s", lab),
+                              cohort_color = col),
+            height = 320
+          ) |> plotly::config(displaylogo = FALSE, responsive = TRUE),
+          height = 340
+        )
+      )
+    })
+  )
+}
+
+# ── Section 3: Students Below Grade Thresholds ──────────────────────────
+s3_widget <- ui_plot_box(
+  thresholds_plotly_multi(cohort_thresholds, cohort_colors, height = 420),
+  height = 440
+)
+
+# ── Section 4: Assessment Breakdown by Cohort ───────────────────────────
+s4_widget <- if (nrow(cohort_breakdown_df) == 0) {
+  ui_banner("No gradebook breakdown available for any cohort.", variant = "info")
+} else {
+  per_cohort <- cohort_breakdown_df |>
+    dplyr::group_by(.data$assessment, .data$cohort) |>
+    dplyr::summarise(
+      median = stats::median(.data$median, na.rm = TRUE),
+      n      = sum(.data$n, na.rm = TRUE),
+      .groups = "drop"
+    )
+  per_cohort$display <- ifelse(
+    is.na(per_cohort$median) | !is.finite(per_cohort$median),
+    NA_character_,
+    sprintf("%.1f (%d)", round(per_cohort$median, 1), as.integer(per_cohort$n))
+  )
+  wide <- per_cohort |>
+    dplyr::select("assessment", "cohort", "display") |>
+    tidyr::pivot_wider(names_from = "cohort", values_from = "display")
+  wide$Type <- assessment_type_from_name(wide$assessment)
+  cohort_cols <- intersect(names(all_data), names(wide))
+  wide <- wide |>
+    dplyr::select("Type", "Assessment" = "assessment", all_of(cohort_cols)) |>
+    dplyr::arrange(.data$Type, .data$Assessment)
+
+  type_col_idx   <- which(names(wide) == "Type") - 1L
+  assess_col_idx <- which(names(wide) == "Assessment") - 1L
+  cohort_idx     <- which(names(wide) %in% cohort_cols) - 1L
+  js_cohort_idx  <- paste0("[", paste(cohort_idx, collapse = ","), "]")
+  rowcb <- DT::JS(paste0(
+    "function(row, data, dispIndex) {",
+    "  var idx = ", js_cohort_idx, ";",
+    "  idx.forEach(function(i){",
+    "    var c = $('td:eq('+(i)+')', row);",
+    "    var t = (c.text() || '').trim();",
+    "    if (t === '' || t === 'NA') {",
+    "      c.text('Not offered').css({'color':'#9AA5B1','font-style':'italic','text-align':'center'});",
+    "    } else {",
+    "      c.css({'text-align':'right','font-variant-numeric':'tabular-nums'});",
+    "    }",
+    "  });",
+    "  if (dispIndex % 2 === 1) { $(row).css('background-color', '#F9FAFB'); }",
+    "  $('td:eq('+(", type_col_idx, ")+')', row).css({'color':'#5A6472','font-size':'11px','text-transform':'uppercase','letter-spacing':'0.05em','font-weight':'600'});",
+    "}"
+  ))
+
+  DT::datatable(
+    wide, rownames = FALSE, escape = FALSE,
+    extensions = "Buttons",
+    options = list(
+      dom = "Bfrtip", buttons = c("csv"),
+      pageLength = 50, scrollX = FALSE, ordering = TRUE,
+      columnDefs = list(
+        list(targets = type_col_idx,   width = "130px", className = "dt-left"),
+        list(targets = assess_col_idx, className = "dt-left"),
+        list(targets = cohort_idx,     className = "dt-right", width = "120px")
+      ),
+      rowCallback = rowcb,
+      initComplete = DT::JS(
+        "function(settings, json) {",
+        "  $(this.api().table().header()).find('th').css({",
+        "    'background-color': '#003F6B',",
+        "    'color':            '#FFFFFF',",
+        "    'font-weight':      '600'",
+        "  });",
+        "}"
+      )
+    )
+  )
+}
+
+# ── Section 5: Cohort Aggregate Statistics ──────────────────────────────
+s5_widget <- if (length(all_data) == 0) {
+  ui_banner("No gradebook data available for any cohort.", variant = "info")
+} else {
+  aggregate_rows <- lapply(names(all_data), function(lab) {
+    r <- all_data[[lab]]
+    col <- cohort_color_for(lab)
+    cohort_cell <- sprintf(
+      '<span style="display:inline-block;width:10px;height:10px;border-radius:50%%;background:%s;margin-right:8px;vertical-align:middle;"></span>%s',
+      col, htmlEscape(lab)
+    )
+    if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) || nrow(r$grades_df) == 0) {
+      return(data.frame(
+        Cohort = cohort_cell,
+        Median = NA_real_, Mean = NA_real_, SD = NA_real_,
+        Min = NA_real_, Max = NA_real_, N = 0L,
+        `% ≥ 80` = NA_real_, `% ≥ 90` = NA_real_, `% ≥ 95` = NA_real_,
+        check.names = FALSE, stringsAsFactors = FALSE
+      ))
+    }
+    final <- r$grades_df |>
+      dplyr::filter(.data$assessment %in% c("weighted_overall_grade",
+                                            "individual_weighted_overall"))
+    df <- if (nrow(final) > 0) final else r$grades_df
+    g <- df$grade[is.finite(df$grade)]
+    data.frame(
+      Cohort = cohort_cell,
+      Median = round(stats::median(g), 1),
+      Mean   = round(mean(g), 1),
+      SD     = round(stats::sd(g), 2),
+      Min    = round(min(g), 1),
+      Max    = round(max(g), 1),
+      N      = as.integer(dplyr::n_distinct(df$id)),
+      `% ≥ 80` = round(100 * mean(g >= 80), 1),
+      `% ≥ 90` = round(100 * mean(g >= 90), 1),
+      `% ≥ 95` = round(100 * mean(g >= 95), 1),
+      check.names = FALSE, stringsAsFactors = FALSE
+    )
+  })
+  aggregate_df <- do.call(rbind, aggregate_rows)
+  num_cols_0idx <- which(names(aggregate_df) != "Cohort") - 1L
+  DT::datatable(
+    aggregate_df, rownames = FALSE, escape = FALSE,
+    options = list(
+      dom = "t", pageLength = 20, scrollX = FALSE, ordering = FALSE,
+      columnDefs = list(
+        list(targets = 0,             className = "dt-left", width = "220px"),
+        list(targets = num_cols_0idx, className = "dt-right")
+      ),
+      initComplete = DT::JS(
+        "function(settings, json) {",
+        "  $(this.api().table().header()).find('th').css({",
+        "    'background-color': '#003F6B',",
+        "    'color':            '#FFFFFF',",
+        "    'font-weight':      '600'",
+        "  });",
+        "}"
+      ),
+      rowCallback = DT::JS(
+        "function(row, data, dispIndex) {",
+        "  if (dispIndex % 2 === 1) { $(row).css('background-color', '#F9FAFB'); }",
+        "}"
+      )
+    )
+  )
+}
+
+# ── Compose: stack the five sections vertically ─────────────────────────
+# Each section is a white card per spec: width:100%;display:block;clear:both;
+# margin-bottom:48px;padding:24px;background:#FFFFFF;border-radius:12px;
+# box-shadow:0 2px 8px rgba(0,0,0,0.07). Inline style keeps the spec
+# self-evident at the call site; the .cvm-card class mirrors the same
+# values and also wires scoped table styling (Fix 4).
+card_style <- paste0(
+  "width:100%;display:block;clear:both;",
+  "margin-bottom:48px;padding:24px;",
+  "background:#FFFFFF;border:1px solid #EEF1F5;border-radius:12px;",
+  "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+)
+
+tagList(
+  tags$div(
+    class = "cvm-card",
+    style = card_style,
+    section_head(
+      "Grade Performance by Cohort",
+      "Overall grade statistics for each graduating class — median, spread, and the share meeting pass thresholds."
+    ),
+    s1_widget
+  ),
+  tags$div(
+    class = "cvm-card",
+    style = card_style,
+    section_head(
+      "Grade Distribution by Cohort",
+      "Histogram of final grades for each cohort — shape and spread side by side."
+    ),
+    s2_widget
+  ),
+  tags$div(
+    class = "cvm-card",
+    style = card_style,
+    section_head(
+      "Students Below Grade Thresholds",
+      "Counts of students finishing below 70%, 80%, and 90%, grouped by cohort."
+    ),
+    s3_widget
+  ),
+  tags$div(
+    class = "cvm-card",
+    style = card_style,
+    section_head(
+      "Assessment Breakdown by Cohort",
+      "Median score and N per assessment, pivoted across cohorts to compare item-level performance over time."
+    ),
+    s4_widget
+  ),
+  tags$div(
+    class = "cvm-card",
+    style = card_style,
+    section_head(
+      "Cohort Aggregate Statistics",
+      "Full descriptive statistics per cohort, including pass-rate cuts at 80 / 90 / 95%."
+    ),
+    s5_widget
+  )
+)
+```
+
+# Curriculum Tag Coverage
+
+```{r}
+#| title: "Curriculum coverage"
+# Full-width vertical stack — one section per tag set. Per spec:
+#   1. Section heading card
+#   2. Per-cohort coverage rows (colored dot + x/y tags + % + progress bar)
+#   3. Grouped bar chart (tag counts per cohort)
+#   4. Multi-column heatmap (one column per cohort)
+#   5. Uncovered-tag pills with per-cohort dots (solid = covered, hollow = not)
+#
+# Implementation: ONE regular R chunk returning a nested tagList. No
+# output: asis and no print() inside an asis block — widgets go through
+# htmltools' knit_print which correctly registers plotly dependencies.
+
+if (length(tag_set_names) == 0) {
+  ui_banner("No tag coverage data available for this course.", variant = "info")
+} else {
+
+  # -- htmltools-rendered coverage heatmap -----------------------------
+  # The key accreditation visual. Pure HTML grid (no plotly) so:
+  #   * cells are guaranteed ≥ 36px tall and show the count number directly
+  #   * each column fills white → that cohort's assigned color at the
+  #     column's own max (so the same count reads differently across
+  #     cohorts by color, which is the point — per-column saturation)
+  #   * printable/PDF-friendly: no canvas, no JS required to see it
+  render_tag_heatmap <- function(cohort_counts, cohort_colors, all_tags) {
+    if (length(all_tags) == 0 || length(cohort_counts) == 0) {
+      return(tags$p(style = "color:#5A6472;margin:12px 0;",
+                    "No data for heatmap."))
+    }
+    labels <- names(cohort_counts)
+    # Column max for normalization (avoid 0 divide).
+    col_max <- vapply(labels, function(lab) {
+      vs <- cohort_counts[[lab]]
+      m <- suppressWarnings(max(as.numeric(vs[names(vs) %in% all_tags]), na.rm = TRUE))
+      if (!is.finite(m) || m <= 0) 1 else m
+    }, numeric(1))
+
+    header_row <- tags$div(
+      style = sprintf(
+        "display:grid;grid-template-columns:240px repeat(%d, 1fr);gap:2px;margin-bottom:2px;",
+        length(labels)
+      ),
+      tags$div(style = "font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#5A6472;font-weight:600;padding:8px 4px;", "Tag"),
+      lapply(labels, function(lab) {
+        col <- cohort_color_for(lab)
+        tags$div(
+          style = sprintf("padding:10px 6px;text-align:center;font-size:11px;font-weight:700;color:#FFFFFF;background:%s;border-radius:6px 6px 0 0;letter-spacing:0.03em;", col),
+          lab
+        )
+      })
+    )
+
+    body_rows <- lapply(all_tags, function(t) {
+      tags$div(
+        style = sprintf(
+          "display:grid;grid-template-columns:240px repeat(%d, 1fr);gap:2px;margin-bottom:2px;",
+          length(labels)
+        ),
+        tags$div(
+          style = "padding:8px 6px;font-size:12px;color:#1A1A2E;min-height:36px;display:flex;align-items:center;border-right:1px solid #E0E4EC;",
+          t
+        ),
+        lapply(labels, function(lab) {
+          col <- cohort_color_for(lab)
+          vs <- cohort_counts[[lab]]
+          val <- if (t %in% names(vs)) as.numeric(vs[[t]]) else 0
+          ratio <- if (is.finite(val) && val > 0) val / col_max[[lab]] else 0
+          bg <- hex_rgba(col, ratio)
+          # Text color flips to white once fill is dark enough.
+          txt_col <- if (ratio > 0.55) "#FFFFFF" else "#1A1A2E"
+          tags$div(
+            style = sprintf(
+              "min-height:36px;background:%s;color:%s;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:500;border:1px solid #E4E7EC;border-radius:4px;",
+              bg, txt_col
+            ),
+            title = sprintf("%s — %s: %d", t, lab, as.integer(val)),
+            if (val > 0) format(as.integer(val)) else "·"
+          )
+        })
+      )
+    })
+
+    tags$div(
+      style = "margin:8px 0 16px 0;overflow-x:auto;",
+      header_row,
+      body_rows
+    )
+  }
+
+  # -- per-section builder ---------------------------------------------
+  build_tagset_section <- function(ts) {
+    pretty <- pretty_tagset_name(ts)
+
+    cohort_counts <- stats::setNames(
+      lapply(names(all_data), function(lab) {
+        r <- all_data[[lab]]
+        if (is.null(r$tag_coverage) || length(r$tag_coverage) == 0) return(integer(0))
+        merged <- dplyr::bind_rows(Filter(Negate(is.null),
+                                          lapply(r$tag_coverage, function(x) x[[ts]])))
+        tagset_counts_vec(merged)
+      }),
+      names(all_data)
+    )
+
+    # Taxonomy-wide totals for the heading subtitle.
+    all_tags_any <- unique(unlist(lapply(cohort_counts, names)))
+    all_tags_any <- all_tags_any[!is_deprecated_tag(all_tags_any)]
+    n_total_tags <- length(all_tags_any)
+    n_any_cov <- sum(vapply(all_tags_any, function(t) {
+      any(vapply(cohort_counts, function(cc) {
+        v <- if (t %in% names(cc)) cc[[t]] else 0; v > 0
+      }, logical(1)))
+    }, logical(1)))
+
+    coverage_row <- function(lab) {
+      col <- cohort_color_for(lab)
+      r <- all_data[[lab]]
+      merged <- if (!is.null(r$tag_coverage) && length(r$tag_coverage) > 0) {
+        dplyr::bind_rows(Filter(Negate(is.null),
+                                lapply(r$tag_coverage, function(x) x[[ts]])))
+      } else tibble::tibble()
+      s <- tag_coverage_summary(merged)
+      pct_display <- if (is.na(s$pct)) "—" else sprintf("%.1f%%", s$pct)
+      pct_w <- if (is.na(s$pct)) 0 else max(0, min(100, as.numeric(s$pct)))
+      # CRITICAL: use CSS GRID (not flex). Quarto auto-injects
+      # `html-fill-container` onto every htmltools child, which sets
+      # `flex: 1 1 auto` and overrides our per-child min-widths — making
+      # flex siblings collapse to near-zero. CSS grid with explicit
+      # column tracks is immune to that override.
+      # Fix 2: per-spec 5-column grid — 20px dot | 180px name | 120px
+      # "X / Y tags" | 60px percentage | 1fr progress bar. Gap 12px,
+      # 10px vertical padding, 1px bottom border between rows.
+      tags$div(
+        class = "cvm-filterable",
+        `data-cohort-labels` = lab,
+        style = "display:grid;grid-template-columns:20px 180px 120px 60px 1fr;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid #F0F0F0;",
+        # col 1: colored dot (14px dot centered inside 20px track)
+        tags$span(style = sprintf(
+          "display:inline-block;width:14px;height:14px;border-radius:50%%;background:%s;", col
+        )),
+        # col 2: cohort name
+        tags$span(style = "font-weight:600;color:#003F6B;white-space:nowrap;", lab),
+        # col 3: "X / Y tags"
+        tags$span(style = "color:#5A6472;font-size:13px;white-space:nowrap;",
+                  sprintf("%d / %d tags", s$covered, s$total)),
+        # col 4: percentage (right-aligned inside its 60px cell)
+        tags$span(style = sprintf("font-weight:600;color:%s;white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums;", col),
+                  pct_display),
+        # col 5: progress bar fills remaining space
+        tags$div(
+          style = "background:#E8ECF0;height:10px;border-radius:999px;overflow:hidden;",
+          tags$div(style = sprintf(
+            "background:%s;height:100%%;width:%.1f%%;border-radius:999px;", col, pct_w))
+        )
+      )
+    }
+
+    # Bar chart: larger min height + more margin for readable tag labels.
+    bar <- tag_bar_plotly_multi(
+      cohort_counts, cohort_colors, title = pretty,
+      height = max(500, 80 + 26 * length(all_tags_any))
+    )
+
+    # Heatmap — rebuilt as htmltools grid (see render_tag_heatmap above).
+    heatmap_ui <- render_tag_heatmap(cohort_counts, cohort_colors, all_tags_any)
+
+    # Uncovered in EVERY cohort = uncovered_universe. The original helper
+    # surfaced "uncovered in ANY cohort"; per spec tightened to "Not
+    # covered in any cohort" so the panel is clearly a gap list.
+    fully_uncovered <- all_tags_any[vapply(all_tags_any, function(t) {
+      all(vapply(cohort_counts, function(cc) {
+        v <- if (t %in% names(cc)) cc[[t]] else 0; v == 0
+      }, logical(1)))
+    }, logical(1))]
+
+    uncovered_ui <- if (length(fully_uncovered) == 0) {
+      tags$p(
+        style = sprintf("color:%s;font-weight:500;margin:12px 0 0 0;", CVM_PALETTE$success),
+        "Every tag is covered in at least one cohort."
+      )
+    } else {
+      tagList(
+        tags$p(
+          style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;font-weight:600;margin:16px 0 8px 0;",
+          sprintf("Not covered in any cohort (%d)", length(fully_uncovered))
+        ),
+        tags$div(
+          style = "display:flex;flex-wrap:wrap;gap:8px;margin-top:4px;",
+          lapply(fully_uncovered, function(t) {
+            tags$span(
+              style = "display:inline-block;padding:6px 12px;border:1px solid #003F6B;border-radius:20px;color:#003F6B;background:#FFFFFF;font-size:12px;font-weight:500;white-space:nowrap;",
+              t
+            )
+          })
+        )
+      )
+    }
+
+    # Fix 2 + Fix 4: the whole tag-set section is ONE white card per spec
+    # (12px radius, subtle shadow, 24px padding). Gold 4px accent rule on
+    # the left keeps the brand tag-coverage motif. Inside the card: a
+    # compact header row (title + tag-count pill), then sub-sections
+    # titled with `.cvm-card-title` (navy 16px/600).
+    tags$div(
+      class = "cvm-card",
+      style = paste0(
+        "width:100%;display:block;clear:both;",
+        "margin-bottom:48px;padding:24px;",
+        "background:#FFFFFF;border:1px solid #EEF1F5;border-left:4px solid #AB8B00;",
+        "border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+      ),
+      # Card header: tag-set title + muted subtitle + gold pill.
+      tags$div(
+        style = "display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px;",
+        tags$div(
+          tags$h2(class = "cvm-card-title", pretty),
+          tags$p(class = "cvm-card-desc",
+                 sprintf("%d covered across all cohorts · %d total in taxonomy",
+                         n_any_cov, n_total_tags))
+        ),
+        tags$span(
+          style = "display:inline-flex;align-items:center;gap:6px;background:#FFF5E0;border:1px solid #E8D78A;color:#8A6D00;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:600;letter-spacing:0.02em;",
+          tags$strong(style = "color:#AB8B00;", n_total_tags),
+          " tags"
+        )
+      ),
+      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:8px;", "Coverage by cohort"),
+      lapply(names(all_data), coverage_row),
+      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:24px;", "Tag-by-tag counts (grouped bar chart)"),
+      ui_plot_box(bar$plot, height = max(520, 100 + 26 * length(all_tags_any))),
+      ui_deprecated_note(bar$deprecated_count),
+      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:24px;", "Coverage heatmap — counts per cohort"),
+      heatmap_ui,
+      uncovered_ui
+    )
+  }
+
+  do.call(tagList, lapply(tag_set_names, build_tagset_section))
+}
+```
+
+# Cross-Year Comparison
+
+```{r}
+#| title: "Cross-year comparison"
+# Redesigned as a set of analyses that mean something for curriculum
+# evaluation (per spec):
+#
+#   1. Grade trajectory — per-cohort arrow vs. previous cohort, ± delta
+#   2. Delivery consistency score — CV of medians → High / Medium / Low
+#   3. Student volume trend — bar chart of N students per cohort
+#   4. Top 5 most consistently covered tags (highest minimum count)
+#   5. Top 5 most variable tags (curriculum-gap signals)
+#   6. Assessment difficulty signal — per-assessment trend across cohorts,
+#      decline > 5 points flagged
+#
+# All analyses come from helpers in R/comparison_engine.R so the same code
+# powers the rule-based narrative and this tab.
+
+if (length(all_data) < 2) {
+  ui_banner("Only one cohort has data for this course — cross-year comparison requires two or more.", variant = "info")
+} else {
+  traj         <- compute_cohort_trajectory(all_data)
+  consistency  <- compute_consistency_score(all_data)
+  volume       <- compute_student_volume(all_data)
+  assess_trend <- compute_assessment_trends(all_data, min_cohorts = 3)
+
+  # Re-derive cohort_counts_by_ts for tag stats.
+  cohort_counts_by_ts <- stats::setNames(
+    lapply(tag_set_names, function(ts) {
+      stats::setNames(
+        lapply(all_data, function(r) {
+          if (is.null(r$tag_coverage) || length(r$tag_coverage) == 0) return(integer(0))
+          merged <- dplyr::bind_rows(Filter(Negate(is.null),
+                                            lapply(r$tag_coverage, function(x) x[[ts]])))
+          tagset_counts_vec(merged)
+        }),
+        names(all_data)
+      )
+    }),
+    tag_set_names
+  )
+  tag_stats <- compute_tag_stats(cohort_counts_by_ts)
+  top_c <- top_consistent_tags(tag_stats, 5)
+  top_v <- top_variable_tags(tag_stats, 5)
+
+  # ---------- 1. Grade trajectory ----------
+  trajectory_ui <- {
+    rows <- lapply(seq_len(nrow(traj)), function(i) {
+      row <- traj[i, ]
+      col <- cohort_color_for(row$cohort)
+      trend <- row$trend
+      # "anomaly" = this cohort's own median > 100 (extra-credit scale).
+      # We surface it explicitly rather than producing a nonsense delta.
+      arrow <- switch(trend %||% "NA",
+                      up      = "▲",
+                      down    = "▼",
+                      stable  = "▬",
+                      anomaly = "⚠",
+                      "—")
+      arrow_color <- switch(trend %||% "NA",
+                            up      = CVM_PALETTE$success,
+                            down    = CVM_PALETTE$warning,
+                            stable  = CVM_PALETTE$muted,
+                            anomaly = CVM_PALETTE$alert,
+                            CVM_PALETTE$muted)
+      delta_text <- if (identical(trend, "anomaly")) {
+        "Scale anomaly — median > 100% (extra-credit-inflated)"
+      } else if (is.na(row$delta)) {
+        "(no valid prior cohort)"
+      } else {
+        sprintf("%+.1f vs %s",
+                row$delta,
+                sub("^Class of ", "GC",
+                    substr(row$prev_cohort,
+                           nchar(row$prev_cohort) - 3,
+                           nchar(row$prev_cohort))))
+      }
+      # Trajectory rows live inside a white .cvm-card, so the row itself
+      # is transparent with a subtle bottom border — matches tag-coverage
+      # rows visually.
+      tags$div(
+        style = "display:grid;grid-template-columns:20px 180px 40px 140px 1fr;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid #F0F0F0;",
+        tags$span(style = sprintf(
+          "display:inline-block;width:14px;height:14px;border-radius:50%%;background:%s;", col
+        )),
+        tags$span(style = "font-weight:600;color:#003F6B;white-space:nowrap;", row$cohort),
+        tags$span(style = sprintf("font-size:22px;font-weight:700;color:%s;text-align:center;", arrow_color), arrow),
+        tags$span(style = "color:#1A1A2E;white-space:nowrap;font-variant-numeric:tabular-nums;",
+                  sprintf("Median %.1f", row$median)),
+        tags$span(style = sprintf("font-size:12px;color:%s;", arrow_color), delta_text)
+      )
+    })
+    rows
+  }
+
+  # ---------- 2. Consistency score ----------
+  cv_display <- if (is.null(consistency$cv) || is.na(consistency$cv)) "—"
+                else sprintf("%.2f%%", consistency$cv)
+  consistency_bar <- switch(consistency$label,
+                            High   = CVM_PALETTE$success,
+                            Medium = CVM_PALETTE$warning,
+                            Low    = CVM_PALETTE$alert,
+                            CVM_PALETTE$muted)
+  # Hero pull-quote rendered flush inside the Trajectory card's right
+  # column. Left accent rule preserves the status color (success / warn
+  # / alert) without reintroducing a nested-card shadow.
+  consistency_ui <- tags$div(
+    style = sprintf(
+      "border-left:4px solid %s;padding:8px 0 8px 20px;min-height:200px;display:flex;flex-direction:column;justify-content:center;",
+      consistency_bar
+    ),
+    tags$div(
+      style = "font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;margin-bottom:12px;",
+      "Delivery consistency"
+    ),
+    tags$div(
+      style = sprintf("font-size:56px;font-weight:700;color:%s;line-height:1;letter-spacing:-0.02em;", consistency_bar),
+      consistency$label
+    ),
+    tags$div(
+      style = "font-size:13px;color:#1A1A2E;margin-top:10px;font-variant-numeric:tabular-nums;",
+      sprintf("CV = %s across %d cohorts", cv_display, length(all_data))
+    ),
+    tags$p(
+      style = "margin:16px 0 0 0;font-size:12px;color:#5A6472;line-height:1.5;",
+      "Low CV = stable course delivery year over year. High CV flags year-to-year inconsistency that warrants investigation."
+    )
+  )
+
+  # ---------- 3. Student volume ----------
+  # Data labels on top of each bar per spec.
+  volume_bar <- plotly::plot_ly(
+    data = volume,
+    x = ~cohort, y = ~students, type = "bar",
+    marker = list(color = unname(cohort_colors[volume$cohort])),
+    text = ~students,
+    textposition = "outside",
+    textfont = list(color = "#1A1A2E", size = 12, family = "Inter"),
+    hovertemplate = "%{x}<br>%{y} students<extra></extra>",
+    height = 320
+  ) |>
+    plotly::layout(
+      title = list(text = "Students assessed per cohort",
+                   font = list(color = CVM_PALETTE$navy, size = 14)),
+      xaxis = list(title = "", tickangle = -20, type = "category", automargin = TRUE),
+      yaxis = list(title = "N students", gridcolor = "#E4E7EC",
+                   rangemode = "tozero",
+                   # Headroom for the data label on the tallest bar.
+                   range = c(0, max(volume$students, na.rm = TRUE) * 1.15)),
+      paper_bgcolor = "white", plot_bgcolor = "white",
+      font = list(color = CVM_PALETTE$text, family = "Inter, sans-serif"),
+      margin = list(t = 50, b = 80, l = 60, r = 40),
+      showlegend = FALSE, autosize = TRUE
+    ) |>
+    plotly::config(displaylogo = FALSE, responsive = TRUE)
+
+  # ---------- 4 + 5. Top consistent / variable tags ----------
+  # Inner mini-cards — soft background + accent rule; sit inside the
+  # parent .cvm-card so they intentionally have no drop shadow.
+  tag_card <- function(title, df, metric_col, metric_label, accent) {
+    tags$div(
+      style = sprintf(
+        "background:#F9FAFB;border-left:4px solid %s;border-radius:8px;padding:18px 20px;",
+        accent
+      ),
+      tags$div(
+        style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;font-weight:600;margin-bottom:10px;",
+        title
+      ),
+      if (nrow(df) == 0) {
+        tags$p(style = "color:#5A6472;font-size:13px;margin:0;",
+               "Not enough tag variance across cohorts to rank.")
+      } else {
+        tags$ol(
+          style = "margin:0;padding-left:20px;",
+          lapply(seq_len(nrow(df)), function(i) {
+            row <- df[i, ]
+            tags$li(
+              style = "padding:4px 0;font-size:13px;color:#1A1A2E;",
+              tags$strong(row$tag),
+              tags$span(
+                style = "color:#5A6472;font-size:11px;margin-left:6px;",
+                sprintf("(%s · %s %s)",
+                        pretty_tagset_name(row$tagset),
+                        metric_label,
+                        if (is.numeric(row[[metric_col]])) sprintf("%.1f", row[[metric_col]])
+                        else as.character(row[[metric_col]]))
+              )
+            )
+          })
+        )
+      }
+    )
+  }
+  # Fix 3: explicit two-column CSS grid (not auto-fit / not floated / not
+  # absolutely positioned) so the two tag-signal cards sit side-by-side
+  # without overlap.
+  tag_cards_ui <- tags$div(
+    style = "display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:8px;",
+    tag_card("Top 5 most consistently covered tags",
+             top_c, "min", "min count",
+             CVM_PALETTE$success),
+    tag_card("Top 5 most variable tags (possible gaps)",
+             top_v, "sd", "SD",
+             CVM_PALETTE$warning)
+  )
+
+  # ---------- 6. Assessment difficulty signal ----------
+  assess_ui <- if (nrow(assess_trend) == 0) {
+    ui_banner(paste("No assessment has data in 3+ cohorts yet — difficulty",
+                    "trends will become available as more cohorts finish."),
+              variant = "info")
+  } else {
+    df <- assess_trend
+    df$Flag <- vapply(df$flag, function(f) {
+      switch(f,
+             declining = "⚠ declining",
+             improving = "↑ improving",
+             stable    = "= stable",
+             f)
+    }, character(1))
+    dt <- DT::datatable(
+      df |>
+        dplyr::transmute(
+          Assessment  = .data$assessment,
+          `Cohorts`   = .data$n_cohorts,
+          `First mean`= .data$first_mean,
+          `Last mean` = .data$last_mean,
+          Δ           = .data$delta,
+          Flag        = .data$Flag
+        ),
+      rownames = FALSE, escape = FALSE,
+      options  = list(
+        dom = "tp", pageLength = 15, scrollX = FALSE,
+        columnDefs = list(
+          list(targets = 0, className = "dt-left"),
+          list(targets = 1:5, className = "dt-right")
+        )
+      )
+    ) |>
+      DT::formatStyle(
+        "Flag",
+        backgroundColor = DT::styleEqual(
+          c("⚠ declining", "↑ improving", "= stable"),
+          c("#FFEBEE", "#E8F5E9", "#F5F6FA"))
+      )
+    n_declining <- sum(df$flag == "declining")
+    tagList(
+      if (n_declining > 0) {
+        ui_banner(sprintf(
+          "%d assessment%s showing a mean decline of more than 5 points from earliest to latest cohort — investigate.",
+          n_declining, if (n_declining == 1) "" else "s"
+        ), variant = "warn")
+      },
+      dt
+    )
+  }
+
+  # ---------- Assemble ----------
+  # Fix 3 + Fix 4: every cross-year section is its own white .cvm-card
+  # with 12px radius, subtle shadow, 24px padding. Titles use the navy
+  # 16px/600 `.cvm-card-title`. Cards clear floats and block-level so
+  # the four panels stack cleanly, zero overlap.
+  cy_card_style <- paste0(
+    "width:100%;display:block;clear:both;",
+    "margin-bottom:48px;padding:24px;",
+    "background:#FFFFFF;border:1px solid #EEF1F5;border-radius:12px;",
+    "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+  )
+  tagList(
+    # Card 1: Grade trajectory + Delivery-consistency pull-quote side by side.
+    tags$div(
+      class = "cvm-card", style = cy_card_style,
+      tags$h2(class = "cvm-card-title", "Grade trajectory — cohort over cohort"),
+      tags$p(class = "cvm-card-desc",
+             "Each cohort's median compared to the prior cohort's median, with a delivery-consistency verdict derived from the CV."),
+      tags$div(
+        style = "display:grid;grid-template-columns:2fr 1fr;gap:24px;align-items:start;",
+        tags$div(trajectory_ui),
+        tags$div(consistency_ui)
+      )
+    ),
+    # Card 2: Student volume trend.
+    tags$div(
+      class = "cvm-card", style = cy_card_style,
+      tags$h2(class = "cvm-card-title", "Student volume trend"),
+      tags$p(class = "cvm-card-desc",
+             "Number of students assessed in each cohort — tracks enrollment and curriculum reach."),
+      ui_plot_box(volume_bar, height = 380)
+    ),
+    # Card 3: Tag-coverage signals (two-column grid).
+    tags$div(
+      class = "cvm-card", style = cy_card_style,
+      tags$h2(class = "cvm-card-title", "Tag-coverage signals"),
+      tags$p(class = "cvm-card-desc",
+             "Which tags are reliably covered every year vs. which swing cohort to cohort (potential curriculum gaps)."),
+      tag_cards_ui
+    ),
+    # Card 4: Assessment difficulty signal.
+    tags$div(
+      class = "cvm-card", style = cy_card_style,
+      tags$h2(class = "cvm-card-title", "Assessment difficulty signal"),
+      tags$p(class = "cvm-card-desc",
+             "Per-assessment mean trend across cohorts — declines > 5 points are flagged for faculty review."),
+      assess_ui
+    )
+  )
+}
+```
+
+# Course Insights
+
+```{r}
+narr_path <- sub("\\.rds$", "_narrative.rds", params$all_data_path)
+narrative <- if (file.exists(narr_path)) readRDS(narr_path) else NULL
+
+if (is.null(narrative)) {
+  ui_banner("Course narrative not generated for this render.", variant = "info")
+} else if (isFALSE(narrative$available %||% TRUE)) {
+  HTML(paste0(
+    '<div class="cvm-narrative"><h3>Course narrative not available</h3><p>',
+    htmlEscape(narrative$narrative),
+    '</p></div>'
+  ))
+} else {
+  # Flag cards — icon + colored left border + title + description.
+  sev_palette <- list(
+    high   = list(bar = "#C62828", bg = "#FFEBEE", text = "#8E1A1A", icon = "!", label = "HIGH PRIORITY"),
+    medium = list(bar = "#F57C00", bg = "#FFF3E0", text = "#8A4A00", icon = "!", label = "MEDIUM PRIORITY"),
+    low    = list(bar = "#2E7D32", bg = "#E8F5E9", text = "#1B5E20", icon = "✓", label = "LOW PRIORITY")
+  )
+  flags_ui <- if (!is.null(narrative$flags) && nrow(narrative$flags) > 0) {
+    tagList(lapply(seq_len(nrow(narrative$flags)), function(i) {
+      f <- narrative$flags[i, ]
+      p <- sev_palette[[f$severity]] %||% sev_palette$medium
+      tags$div(
+        style = sprintf(
+          "display:grid;grid-template-columns:32px 1fr;column-gap:14px;align-items:start;padding:16px 20px;margin-bottom:12px;background:%s;border-left:4px solid %s;border-radius:8px;",
+          p$bg, p$bar
+        ),
+        # Circular icon badge
+        tags$span(
+          style = sprintf(
+            "width:28px;height:28px;border-radius:50%%;background:%s;color:#FFFFFF;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;",
+            p$bar
+          ),
+          p$icon
+        ),
+        tags$div(
+          tags$div(
+            style = sprintf("font-size:10px;font-weight:700;letter-spacing:0.1em;color:%s;margin-bottom:4px;", p$bar),
+            p$label
+          ),
+          tags$div(
+            style = sprintf("font-size:14px;font-weight:600;color:%s;margin-bottom:6px;line-height:1.4;", p$text),
+            f$issue
+          ),
+          tags$div(
+            style = sprintf("font-size:13px;color:%s;line-height:1.5;opacity:0.85;", p$text),
+            f$recommendation
+          )
+        )
+      )
+    }))
+  } else NULL
+
+  # Questions — numbered cards. CSS grid for the inner layout so Quarto's
+  # html-fill-container can't collapse the question text to 0 width.
+  questions_ui <- if (length(narrative$questions) > 0) {
+    tags$div(
+      style = "display:grid;row-gap:10px;",
+      lapply(seq_along(narrative$questions), function(i) {
+        q <- narrative$questions[[i]]
+        tags$div(
+          style = "display:grid;grid-template-columns:32px 1fr;column-gap:14px;align-items:start;padding:14px 18px;background:#EEF4FB;border-left:3px solid #003F6B;border-radius:8px;",
+          tags$span(
+            style = "width:28px;height:28px;border-radius:50%;background:#003F6B;color:#FFFFFF;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;",
+            paste0("Q", i)
+          ),
+          tags$div(
+            style = "font-size:13px;color:#1A1A2E;line-height:1.55;word-break:normal;",
+            q
+          )
+        )
+      })
+    )
+  } else NULL
+
+  # Distinguish rule-based vs LLM — the former gets a "Generated from data"
+  # badge; the latter keeps the model attribution.
+  source_kind <- narrative$source %||% "llm"
+  badge <- if (source_kind == "rule-based") {
+    tags$span(
+      style = "display:inline-block;padding:4px 10px;background:#EEF4FB;color:#003F6B;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;border-radius:999px;border:1px solid #CDE0ED;",
+      "Generated from data"
+    )
+  } else {
+    tags$span(
+      style = "display:inline-block;padding:4px 10px;background:#FFF5E0;color:#8A6D00;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;border-radius:999px;border:1px solid #E8D78A;",
+      "Model-generated"
+    )
+  }
+  footer_line <- if (source_kind == "rule-based") {
+    "Narrative is computed from the data. It does not substitute for faculty review."
+  } else {
+    sprintf("Generated %s using %s.",
+            fmt_ts(narrative$generated_at),
+            narrative$model %||% "—")
+  }
+
+  # Fix 4: each insight block is a white card — narrative, flags, and
+  # questions each live in their own .cvm-card. Footer attribution sits
+  # below the last card as muted microcopy.
+  ci_card_style <- paste0(
+    "width:100%;display:block;clear:both;",
+    "margin-bottom:48px;padding:24px;",
+    "background:#FFFFFF;border:1px solid #EEF1F5;border-radius:12px;",
+    "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+  )
+  tagList(
+    tags$div(
+      class = "cvm-card cvm-narrative",
+      style = ci_card_style,
+      tags$div(
+        style = "display:flex;justify-content:flex-end;margin-bottom:12px;",
+        badge
+      ),
+      HTML(markdown_to_html(narrative$narrative))
+    ),
+    if (!is.null(flags_ui)) {
+      tags$div(
+        class = "cvm-card", style = ci_card_style,
+        tags$h2(class = "cvm-card-title", "Areas of concern"),
+        tags$p(class = "cvm-card-desc",
+               "Issues ranked by severity with specific faculty follow-up recommendations."),
+        flags_ui
+      )
+    },
+    if (!is.null(questions_ui)) {
+      tags$div(
+        class = "cvm-card", style = ci_card_style,
+        tags$h2(class = "cvm-card-title", "Questions to explore"),
+        tags$p(class = "cvm-card-desc",
+               "Prompts to carry into the next faculty curriculum-review conversation."),
+        questions_ui
+      )
+    },
+    tags$p(
+      style = "color:#5A6472;font-size:12px;margin:-24px 0 32px 0;padding:0 4px;",
+      footer_line
+    )
+  )
+}
+```
+
+# Downloads
+
+```{r}
+# Filter-aware Downloads tab.
+#
+# - Export Artifacts: ONE compact card listing PPTX + Excel if present;
+#   a single-line info banner if not.
+# - Per-cohort Survey cards: each wrapped in .cvm-filterable so the chip
+#   filter bar shows only cards for currently selected cohorts. Cohort
+#   label as a colored card header; PDF rows compact inside.
+# - Compact banners (not full-height) for empty states.
+#
+# params$all_data_path points at .render_cache/all_years_result.rds;
+# the course folder (where PPTX/XLSX land) is two levels up.
+course_dir <- dirname(dirname(params$all_data_path))
+
+pptx_files <- list.files(course_dir, pattern = "\\.pptx$",          full.names = TRUE)
+xlsx_files <- list.files(course_dir, pattern = "_workbooks\\.zip$", full.names = TRUE)
+
+has_exports <- length(pptx_files) > 0 || length(xlsx_files) > 0
+
+dl_card_style <- paste0(
+  "width:100%;display:block;clear:both;",
+  "margin-bottom:48px;padding:24px;",
+  "background:#FFFFFF;border:1px solid #EEF1F5;border-radius:12px;",
+  "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+)
+
+exports_card <- tags$div(
+  class = "cvm-card",
+  style = dl_card_style,
+  tags$h2(class = "cvm-card-title", "Export artifacts"),
+  tags$p(class = "cvm-card-desc",
+         "Generated PowerPoint and Excel workbooks for this course portfolio."),
+  if (has_exports) {
+    tags$div(
+      style = "display:grid;gap:10px;",
+      if (length(pptx_files) > 0) {
+        ui_download_row("PowerPoint", basename(pptx_files[[1]]),
+                        basename(pptx_files[[1]]),
+                        file.info(pptx_files[[1]])$size)
+      },
+      if (length(xlsx_files) > 0) {
+        ui_download_row("Excel workbooks (zip)", basename(xlsx_files[[1]]),
+                        basename(xlsx_files[[1]]),
+                        file.info(xlsx_files[[1]])$size)
+      }
+    )
+  } else {
+    tags$p(
+      style = "margin:0;font-size:13px;color:#5A6472;",
+      HTML("No PowerPoint or Excel workbook yet. Re-run with <code>--with-exports</code> to generate them.")
+    )
+  }
+)
+
+# Per-cohort survey cards — one .cvm-filterable card per cohort so the
+# chip filter bar shows only the active cohorts.
+survey_cards <- lapply(names(all_data), function(lab) {
+  r <- all_data[[lab]]
+  col <- cohort_color_for(lab)
+  s_dir_abs <- surveys_dir(r$course_code, r$cohort_label)
+  safe_code <- gsub("[^A-Za-z0-9]", "", r$course_code)
+  class_slug_local <- cohort_slug(r$cohort_label)
+  rel_base <- file.path("..", sprintf("%s_%s", safe_code, class_slug_local), "surveys")
+  drop_path_rel <- sub("^.*/outputs/", "outputs/", s_dir_abs)
+
+  # Card header — colored dot + cohort name in cohort color.
+  card_header <- tags$div(
+    style = sprintf("display:flex;align-items:center;gap:10px;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid #E0E4EC;"),
+    tags$span(style = sprintf(
+      "display:inline-block;width:14px;height:14px;border-radius:50%%;background:%s;", col
+    )),
+    tags$span(style = sprintf("font-size:16px;font-weight:700;color:%s;", col), lab)
+  )
+
+  body <- if (!dir.exists(s_dir_abs)) {
+    ready_on <- if (!is.null(r$max_period_finish_date) && !is.na(r$max_period_finish_date)) {
+      format(as.Date(r$max_period_finish_date) + 2)
+    } else "(period end date unknown)"
+    tags$p(
+      style = "margin:0;font-size:12px;color:#5A6472;",
+      sprintf("Survey folder will be created 2 days after course end (%s).",
+              ready_on)
+    )
+  } else {
+    pdfs <- list.files(s_dir_abs, pattern = "\\.pdf$", full.names = TRUE)
+    if (length(pdfs) == 0) {
+      tags$p(
+        style = "margin:0;font-size:12px;color:#5A6472;",
+        HTML(sprintf(
+          "Survey folder ready — drop PDF files at <code>%s</code>",
+          htmlEscape(drop_path_rel)
+        ))
+      )
+    } else {
+      # Fix 3: the "To add more, drop PDFs at …" microcopy was removed
+      # per spec. PDF rows only.
+      tags$div(
+        style = "display:grid;gap:8px;",
+        lapply(pdfs, function(p) {
+          ui_download_row(
+            label      = "Survey PDF",
+            href       = file.path(rel_base, basename(p)),
+            filename   = basename(p),
+            size_bytes = file.info(p)$size
+          )
+        })
+      )
+    }
+  }
+
+  # Fix 5: force survey cards visible by default. The .cvm-filterable
+  # class is only hidden by the filter JS when a chip is deselected — on
+  # initial load every card must render. `display:block !important`
+  # overrides any stray Quarto / bootstrap rule that would hide the card
+  # before JS boots.
+  tags$div(
+    class = "cvm-filterable",
+    `data-cohort-labels` = lab,
+    style = sprintf(
+      "display:block !important;background:#FFFFFF;border:1px solid #E0E4EC;border-left:4px solid %s;border-radius:12px;padding:20px 24px;box-shadow:0 2px 12px rgba(0,0,0,0.07);",
+      col
+    ),
+    card_header, body
+  )
+})
+
+# Surveys section: one outer .cvm-card containing a responsive grid of
+# per-cohort sub-cards (each still .cvm-filterable). The outer card gives
+# the section a navy 16px title and consistent chrome; the inner cards
+# carry the cohort-colored left border.
+surveys_card <- tags$div(
+  class = "cvm-card",
+  style = dl_card_style,
+  tags$h2(class = "cvm-card-title", "Course surveys by cohort"),
+  tags$p(class = "cvm-card-desc",
+         "End-of-course survey PDFs available for each graduating class."),
+  tags$div(
+    style = "display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:20px;",
+    survey_cards
+  )
+)
+
+tagList(exports_card, surveys_card)
+```
+
+```{r}
+#| include: false
+#| output: false
+# Filter-bar JSON payload — next chunk writes the raw HTML block.
+```
+
+```{=html}
+<script id="cvm-dashboard-data" type="application/json">
+`r period_index_json`
+</script>
+<script id="cvm-cohort-colors" type="application/json">
+`r cohort_colors_json`
+</script>
+<script id="cvm-course-code" type="application/json">
+"`r primary$course_code`"
+</script>
+<style>
+  /* Sticky filter bar — scoped via .cvm-* classes so nothing collides with
+     Quarto's Bootstrap layout. */
+  .cvm-filter-bar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: #FFFFFF;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    padding: 12px 24px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    border-bottom: 1px solid #E0E4EC;
+    font-family: Inter, "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  .cvm-filter-bar .label {
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    color: #5A6472;
+  }
+  .cvm-filter-bar .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .cvm-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 14px;
+    border: 2px solid transparent;
+    border-radius: 20px;
+    background: #E8ECF0;
+    color: #9AA5B1;
+    font-size: 12px; font-weight: 500;
+    cursor: pointer; user-select: none;
+    transition: background 120ms, color 120ms, border-color 120ms;
+  }
+  .cvm-chip .chip-dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    box-sizing: border-box;
+    background: transparent;
+    border: 2px solid #9AA5B1;
+  }
+  .cvm-chip:hover { background: #F0F4F8; }
+  .cvm-chip.active {
+    background: #FFFFFF;
+    color: var(--chip-color, #003F6B);
+    border-color: var(--chip-color, #003F6B);
+  }
+  .cvm-chip.active .chip-dot {
+    background: var(--chip-color, #003F6B);
+    border-color: var(--chip-color, #003F6B);
+  }
+  .cvm-chip:focus-visible {
+    outline: 2px solid #AB8B00;
+    outline-offset: 2px;
+  }
+  .cvm-filter-actions { margin-left: auto; display: flex; gap: 14px; }
+  .cvm-filter-actions a {
+    color: #AB8B00; font-size: 13px; font-weight: 500;
+    cursor: pointer; text-decoration: none;
+    border-bottom: 1px dashed rgba(171,139,0,0.4);
+  }
+  .cvm-filter-actions a:hover { color: #003F6B; border-color: #003F6B; }
+  .cvm-filter-actions a:focus-visible {
+    outline: 2px solid #AB8B00; outline-offset: 2px;
+  }
+  .cvm-filterable { transition: opacity 150ms; }
+
+  /* --- Fix 1: histogram grid — fixed 3-column layout, every card exactly
+     360px tall, nothing absolutely-positioned so cards cannot overlap. */
+  .cvm-histogram-grid {
+    display: grid !important;
+    grid-template-columns: repeat(3, 1fr) !important;
+    grid-auto-rows: 360px !important;
+    gap: 16px !important;
+  }
+  .cvm-histogram-grid > .cvm-histogram-card {
+    position: relative !important;
+    height: 360px !important;
+    margin: 0 !important;
+  }
+
+  /* --- Fix 4: Course Insights narrative — never clip; paragraphs breathe. */
+  .cvm-narrative {
+    overflow-y: visible !important;
+    height: auto !important;
+    max-height: none !important;
+  }
+  .cvm-narrative p { margin-bottom: 16px; }
+
+  /* --- Design pass (Brand Guardian / UI Designer / UX Architect):
+     Single card token reused across every tab's content sections.
+     White background, 12px radius, subtle shadow, 24px padding,
+     full-width block that clears floats so nothing overlaps. */
+  .cvm-card {
+    width: 100% !important;
+    display: block !important;
+    clear: both !important;
+    box-sizing: border-box;
+    background: #FFFFFF;
+    border: 1px solid #EEF1F5;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+    padding: 24px;
+    margin-bottom: 48px;
+  }
+  .cvm-card > :first-child { margin-top: 0; }
+  .cvm-card > :last-child  { margin-bottom: 0; }
+
+  /* Section title + description inside a card. Navy 16px/600 per spec. */
+  .cvm-card-title {
+    font-family: Inter, "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 16px;
+    font-weight: 600;
+    color: #003F6B;
+    margin: 0 0 6px 0;
+    letter-spacing: -0.005em;
+  }
+  .cvm-card-desc {
+    font-size: 13px;
+    color: #5A6472;
+    margin: 0 0 20px 0;
+    line-height: 1.5;
+  }
+
+  /* --- Numeric tables (Visual Storyteller / UI Designer):
+     Navy header, alternating #F9FAFB row shading, right-aligned numbers,
+     consistent padding. Scoped under `.cvm-card` so it never touches
+     Overview. */
+  .cvm-card table.dataTable thead th {
+    background-color: #003F6B !important;
+    color: #FFFFFF !important;
+    font-weight: 600 !important;
+    border-bottom: 0 !important;
+    letter-spacing: 0.01em;
+  }
+  .cvm-card table.dataTable tbody tr:nth-child(even) > td {
+    background-color: #F9FAFB !important;
+  }
+  .cvm-card table.dataTable tbody td { border-top: 1px solid #F0F2F5; padding: 10px 12px; }
+  .cvm-card table.dataTable td.dt-right,
+  .cvm-card table.dataTable th.dt-right { text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* --- Charts (Visual Storyteller): 380px floor, 16px internal padding,
+     no clipping. Applies to plotly + htmlwidget containers inside cards. */
+  .cvm-card .plotly.html-widget,
+  .cvm-card .html-widget,
+  .cvm-chart {
+    min-height: 380px !important;
+    padding: 16px;
+    box-sizing: border-box;
+  }
+
+  /* --- Tab-pane hygiene: each redesigned tab scrolls vertically on long
+     content so cards never clip under the navbar. Overview is explicitly
+     excluded — per directive, do not touch it. */
+  .tab-pane#assessment-performance,
+  .tab-pane#curriculum-tag-coverage,
+  .tab-pane#cross-year-comparison,
+  .tab-pane#course-insights,
+  .tab-pane#downloads {
+    overflow-y: auto !important;
+    height: auto !important;
+  }
+</style>
+<script>
+(function() {
+  "use strict";
+
+  // ---- payload ----------------------------------------------------------
+  function parseScript(id) {
+    const el = document.getElementById(id);
+    if (!el) return null;
+    try { return JSON.parse(el.textContent); }
+    catch (e) { console.error("cvm filter: could not parse", id, e); return null; }
+  }
+  const PERIODS = parseScript("cvm-dashboard-data") || [];
+  const COHORT_COLORS = parseScript("cvm-cohort-colors") || {};
+  const COURSE_CODE = parseScript("cvm-course-code") || "default";
+
+  // PERIODS may be per-period (one entry per cperiod_id). Roll up to cohorts.
+  // Each cohort is the filter unit; each period knows its cohort.
+  const COHORTS = [];
+  const seen = new Set();
+  PERIODS.forEach(function(p) {
+    if (!p || !p.cohort_label) return;
+    if (seen.has(p.cohort_label)) return;
+    seen.add(p.cohort_label);
+    COHORTS.push({
+      label: p.cohort_label,
+      slug:  p.cohort_slug,
+      chip:  (p.chip_label || p.label || p.cohort_label),
+      color: COHORT_COLORS[p.cohort_label] || "#003F6B"
+    });
+  });
+  // Ensure consistent chronological order (alphabetic on Class of YYYY).
+  COHORTS.sort(function(a, b) { return a.label < b.label ? -1 : 1; });
+
+  if (COHORTS.length === 0) {
+    console.warn("cvm filter: no cohorts — filter bar not initialized");
+    return;
+  }
+
+  // ---- state ------------------------------------------------------------
+  const STORAGE_KEY = "cvm-filter-" + COURSE_CODE;
+  const ALL_LABELS = COHORTS.map(function(c) { return c.label; });
+  let active;
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+    active = Array.isArray(saved)
+      ? new Set(saved.filter(function(l) { return ALL_LABELS.indexOf(l) >= 0; }))
+      : new Set(ALL_LABELS);
+    if (active.size === 0) active = new Set(ALL_LABELS);
+  } catch (e) { active = new Set(ALL_LABELS); }
+
+  function persist() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Array.from(active))); }
+    catch (e) { /* private mode — ignore */ }
+  }
+
+  // ---- helpers ----------------------------------------------------------
+  function median(xs) {
+    if (xs.length === 0) return null;
+    const s = xs.slice().sort(function(a, b) { return a - b; });
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+
+  // selectedPeriods = per-period rows whose cohort is active.
+  function selectedPeriods() {
+    return PERIODS.filter(function(p) { return active.has(p.cohort_label); });
+  }
+
+  function recomputeKpis() {
+    const sel = selectedPeriods();
+    const medians = sel.map(function(p) { return p.median; })
+                       .filter(function(v) { return typeof v === "number"; });
+    const students = sel.reduce(function(s, p) { return s + (p.students || 0); }, 0);
+    const periods  = sel.length;
+    const tagSets  = sel.reduce(function(m, p) {
+      return Math.max(m, p.n_tag_sets || 0);
+    }, 0);
+
+    setKpi("median",   medians.length ? median(medians).toFixed(1) : "—");
+    setKpi("students", students);
+    setKpi("periods",  periods);
+    setKpi("tag_sets", tagSets);
+  }
+  function setKpi(key, val) {
+    document.querySelectorAll('[data-kpi="' + key + '"] .cvm-kpi-value').forEach(function(el) {
+      el.textContent = String(val);
+    });
+  }
+
+  function apply() {
+    // Chip visual state
+    document.querySelectorAll(".cvm-chip").forEach(function(chip) {
+      const on = active.has(chip.dataset.cohortLabel);
+      chip.classList.toggle("active", on);
+      chip.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    // Filterable content blocks — data-cohort-labels is a comma-separated
+    // list of cohort labels. Cohort labels contain spaces (e.g. "Class of
+    // 2023") so we MUST split only on commas. Splitting on whitespace
+    // shreds labels into ["Class","of","2023"] and hides every block.
+    document.querySelectorAll(".cvm-filterable").forEach(function(el) {
+      const raw = el.dataset.cohortLabels || "";
+      const labels = raw.split(",").map(function(s) { return s.trim(); }).filter(Boolean);
+      const match = labels.length === 0 ? true : labels.some(function(l) { return active.has(l); });
+      // Use setProperty with "important" so we can beat any inline
+      // `display:... !important` (e.g. Fix 5 survey cards). Removing the
+      // property on match lets the element fall back to its natural
+      // `display` — whether that's block, grid-item, flex-item, etc.
+      if (match) {
+        el.style.removeProperty("display");
+      } else {
+        el.style.setProperty("display", "none", "important");
+      }
+    });
+    recomputeKpis();
+  }
+
+  // ---- build the bar ----------------------------------------------------
+  function build() {
+    const nav = document.querySelector(".quarto-dashboard .navbar")
+             || document.querySelector("header.navbar")
+             || document.querySelector("nav");
+    if (!nav) { console.warn("cvm filter: no navbar anchor found"); return; }
+    if (document.querySelector(".cvm-filter-bar")) return;  // already built
+
+    const bar = document.createElement("div");
+    bar.className = "cvm-filter-bar";
+    bar.setAttribute("role", "toolbar");
+    bar.setAttribute("aria-label", "Filter by graduating class");
+
+    const label = document.createElement("div");
+    label.className = "label";
+    label.textContent = "Cohorts";
+    bar.appendChild(label);
+
+    const chipsWrap = document.createElement("div");
+    chipsWrap.className = "chips";
+    COHORTS.forEach(function(c) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "cvm-chip";
+      chip.dataset.cohortLabel = c.label;
+      chip.style.setProperty("--chip-color", c.color);
+      chip.setAttribute("aria-pressed", "false");
+      chip.setAttribute("aria-label", "Toggle " + c.label);
+      const dot = document.createElement("span");
+      dot.className = "chip-dot";
+      chip.appendChild(dot);
+      const txt = document.createElement("span");
+      txt.textContent = c.chip;
+      chip.appendChild(txt);
+      chip.addEventListener("click", function() {
+        if (active.has(c.label)) active.delete(c.label);
+        else active.add(c.label);
+        if (active.size === 0) active = new Set(ALL_LABELS);
+        persist(); apply();
+      });
+      chipsWrap.appendChild(chip);
+    });
+    bar.appendChild(chipsWrap);
+
+    const actions = document.createElement("div");
+    actions.className = "cvm-filter-actions";
+    const selAll = document.createElement("a");
+    selAll.textContent = "Select all";
+    selAll.setAttribute("role", "button");
+    selAll.setAttribute("tabindex", "0");
+    selAll.addEventListener("click", function() { active = new Set(ALL_LABELS); persist(); apply(); });
+    const clear = document.createElement("a");
+    clear.textContent = "Clear";
+    clear.setAttribute("role", "button");
+    clear.setAttribute("tabindex", "0");
+    clear.addEventListener("click", function() {
+      active = new Set();
+      persist(); apply();
+      // 3s safety — reset to all if still empty.
+      setTimeout(function() {
+        if (active.size === 0) { active = new Set(ALL_LABELS); persist(); apply(); }
+      }, 3000);
+    });
+    actions.appendChild(selAll); actions.appendChild(clear);
+    bar.appendChild(actions);
+
+    nav.parentNode.insertBefore(bar, nav.nextSibling);
+  }
+
+  // ---- init -------------------------------------------------------------
+  let booted = false;
+  function runOnce() {
+    if (!booted) {
+      booted = true;
+      try { build(); } catch (e) { console.error("cvm filter: build failed", e); }
+    }
+    try {
+      apply();
+      console.log("cvm filter: apply OK, " + COHORTS.length + " cohorts, active=" + active.size);
+    } catch (e) { console.error("cvm filter: apply failed", e); }
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", runOnce);
+  } else {
+    runOnce();
+  }
+  window.addEventListener("load", runOnce);
+  setTimeout(runOnce, 300);
+})();
+</script>
+```

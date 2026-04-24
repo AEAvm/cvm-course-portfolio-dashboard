@@ -1,0 +1,60 @@
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user
+*.Rproj
+
+# renv
+renv/library/
+renv/staging/
+renv/sandbox/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+
+# Outputs — never commit rendered HTML or exports
+outputs/
+
+# Data — course ID CSVs and cache stay local
+data/cache/
+data/course_ids/
+
+# Logs
+logs/
+
+# Surveys and generated PDFs
+*/surveys/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.Renviron
+.env
+.env.local
+
+# Quarto work products
+_freeze/
+.quarto/
+templates/lib/
+templates/*_files/
+
+# Editors
+.vscode/
+.idea/
+
+# Temp
+*.tmp
+*~
+*.swp
+
+# Build artifacts
+*.tar.gz
+inst/pptx_template/*.pptx
+!inst/pptx_template/course-review-presentation-template.pptx
+
+# Transient render staging
+**/.render_cache/

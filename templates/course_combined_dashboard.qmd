@@ -1,0 +1,614 @@
+---
+format:
+  dashboard:
+    embed-resources: false
+    theme:
+      - default
+      - lib/custom.scss
+    nav-buttons: []
+    orientation: rows
+params:
+  all_data_path: ""
+  render_ts: ""
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+proj_root <- normalizePath("..", winslash = "/")
+knitr::opts_knit$set(root.dir = proj_root)
+
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(plotly); library(DT); library(htmltools)
+  library(jsonlite)
+})
+for (f in c("utils.R", "data_layer.R", "portfolio_runner.R",
+            "comparison_engine.R", "ai_interpret.R", "plot_helpers.R",
+            "html_components.R")) {
+  source(file.path(proj_root, "R", f), local = FALSE)
+}
+
+all_data <- readRDS(params$all_data_path)
+all_data <- Filter(Negate(is.null), all_data)
+stopifnot(length(all_data) >= 1)
+
+primary   <- all_data[[length(all_data)]]   # latest cohort by order of entry
+render_ts <- if (nzchar(params$render_ts %||% "")) {
+  params$render_ts
+} else {
+  format(Sys.time(), "%Y-%m-%d %H:%M")
+}
+
+overall_medians <- vapply(all_data, function(r) r$kpi$overall_median %||% NA_real_, numeric(1))
+total_students  <- sum(vapply(all_data, function(r) r$kpi$total_students  %||% 0L, integer(1)))
+total_periods   <- sum(vapply(all_data, function(r) r$kpi$periods_covered %||% 0L, integer(1)))
+
+# Period index — feeds the sticky filter bar. Serialize to JSON for JS.
+period_index       <- build_period_index(all_data)
+period_index_json  <- jsonlite::toJSON(period_index, auto_unbox = TRUE, null = "null")
+
+# Helper: per-cohort data-period-keys attribute, space-separated. The
+# filter JS shows/hides any element whose data-period-keys overlaps the
+# active period set. For all_data entries with multiple periods, we list
+# all period IDs under that cohort.
+cohort_period_keys <- function(r) {
+  if (is.null(r) || length(r$periods) == 0) return("")
+  slug <- cohort_slug(r$cohort_label)
+  paste(sprintf("%d_%s", as.integer(r$periods), slug), collapse = " ")
+}
+```
+
+---
+title: "`r sprintf('%s — %s (All years)', primary$course_code, primary$course_name)`"
+---
+
+# {.sidebar}
+
+```{r}
+cohort_labels <- vapply(all_data, function(r) r$cohort_label, character(1))
+ts_names <- if (!is.null(primary$tag_coverage) && length(primary$tag_coverage) > 0) {
+  pretty_tagset_name(names(primary$tag_coverage[[1]] %||% list()))
+} else character(0)
+
+ui_sidebar(
+  course_code = primary$course_code,
+  course_name = primary$course_name,
+  metadata = c(
+    sprintf("Combined view — %d classes", length(all_data)),
+    sprintf("%d periods total", total_periods),
+    sprintf("Rendered %s", render_ts)
+  ),
+  extra_sections = list(
+    list(title = "Classes included",    items = cohort_labels),
+    list(title = "Tag sets available",  items = ts_names)
+  )
+)
+```
+
+# Overview
+
+## Row
+
+```{r}
+#| title: "Portfolio at a glance"
+# Every KPI card is tagged with data-kpi — the filter JS recomputes the .value
+# text on every chip change. Initial values reflect ALL periods selected.
+tagList(
+  ui_kpi_row(
+    ui_kpi_card(
+      label    = "Pooled median",
+      value    = if (any(!is.na(overall_medians))) sprintf("%.1f", median(overall_medians, na.rm = TRUE)) else "—",
+      subvalue = "Median across selected periods",
+      kpi_key  = "median"
+    ),
+    ui_kpi_card(
+      label    = "Students assessed",
+      value    = fmt_num(total_students),
+      subvalue = "Summed across selected periods",
+      kpi_key  = "students"
+    ),
+    ui_kpi_card(
+      label    = "Periods covered",
+      value    = fmt_num(total_periods),
+      kpi_key  = "periods"
+    ),
+    ui_kpi_card(
+      label    = "Tag sets",
+      value    = fmt_num(max(vapply(all_data, function(r) r$kpi$n_tag_sets %||% 0L, integer(1)))),
+      subvalue = "Distinct curriculum tag sets",
+      kpi_key  = "tag_sets"
+    )
+  )
+)
+```
+
+```{r}
+#| title: "Data completeness"
+rows <- lapply(all_data, function(r) {
+  data.frame(
+    cohort        = r$cohort_label,
+    gradebook_ok  = isTRUE(r$gradebook_ok),
+    n_periods     = length(r$periods),
+    n_students    = r$kpi$total_students %||% 0L,
+    stringsAsFactors = FALSE
+  )
+})
+status_df <- do.call(rbind, rows)
+tagList(
+  ui_section_header("Completeness by cohort"),
+  DT::datatable(
+    status_df, rownames = FALSE,
+    options = list(dom = "t", pageLength = 20)
+  ) |>
+    DT::formatStyle("gradebook_ok",
+                    backgroundColor = DT::styleEqual(c(TRUE, FALSE),
+                                                     c("#E8F5E9", "#FFEBEE")))
+)
+```
+
+# Assessment Performance
+
+```{r}
+#| output: asis
+emit_html <- function(tag) {
+  if (is.null(tag)) return(invisible())
+  cat("\n```{=html}\n", as.character(tag), "\n```\n\n", sep = "")
+}
+
+cat("## {.tabset}\n\n")
+for (r in all_data) {
+  cat(sprintf("### %s\n\n", r$cohort_label))
+
+  # Wrap this cohort's entire tab content in a .cvm-filterable div so the
+  # filter JS can show/hide the whole subtree when no periods of this
+  # cohort are selected.
+  keys <- cohort_period_keys(r)
+  emit_html(HTML(sprintf(
+    '<div class="cvm-filterable" data-period-keys="%s">',
+    htmlEscape(keys)
+  )))
+
+  if (!isTRUE(r$gradebook_ok)) {
+    emit_html(ui_banner(
+      text = sprintf(
+        "Gradebook data unavailable for %s. Cross-year overlay still includes this cohort's tag coverage.",
+        htmlEscape(r$cohort_label)
+      ),
+      variant = "warn"
+    ))
+  } else {
+    emit_html(ui_section_header("Median grade trend"))
+    print(trend_plotly(median_trend(r$grades_df),
+                       title = sprintf("Median grade trend — %s", r$cohort_label),
+                       height = 380))
+
+    if (!is.null(r$assessment_plots) && !is.null(r$assessment_plots$median)) {
+      emit_html(ui_section_header("Median by assessment"))
+      print(plotly::ggplotly(r$assessment_plots$median, height = 500) |>
+              plotly::config(displaylogo = FALSE, responsive = TRUE))
+    }
+    if (!is.null(r$assessment_plots) && !is.null(r$assessment_plots$pct)) {
+      emit_html(ui_section_header("Counts below 70% / 80% / 90%"))
+      print(plotly::ggplotly(r$assessment_plots$pct, height = 500) |>
+              plotly::config(displaylogo = FALSE, responsive = TRUE))
+    }
+  }
+
+  emit_html(HTML("</div>"))
+}
+```
+
+# Cross-Year Comparison
+
+## Row
+
+```{r}
+#| title: "Grade trend overlay"
+overlay <- build_grade_overlay(all_data)
+tagList(
+  ui_section_header("Median trend across cohorts"),
+  if (nrow(overlay) == 0) {
+    tags$p(style = "color:#5A6472; padding:24px;",
+           "Not enough grade data to build an overlay.")
+  } else {
+    plotly::plot_ly(
+      overlay, x = ~seq, y = ~median, color = ~cohort,
+      colors = CVM_COHORT_COLORS, type = "scatter", mode = "lines+markers"
+    ) |>
+      plotly::layout(
+        xaxis = list(title = "Period order within cohort"),
+        yaxis = list(title = "Median grade (%)", range = c(0, 100)),
+        paper_bgcolor = "white", plot_bgcolor = "white",
+        font = list(color = "#1A1A2E")
+      )
+  }
+)
+```
+
+## Row
+
+```{r}
+#| title: "Summary by cohort"
+tbl <- build_summary_table(all_data)
+tagList(
+  ui_section_header("Cohort-by-cohort numbers"),
+  DT::datatable(
+    tbl, rownames = FALSE,
+    options = list(dom = "Bfrtip", buttons = c("csv"),
+                   pageLength = 10, scrollX = TRUE),
+    extensions = "Buttons"
+  )
+)
+```
+
+## Row
+
+```{r}
+#| title: "Change narrative"
+td <- build_tag_delta(all_data)
+cn <- change_narrative(td)
+
+card <- function(title, items, klass) {
+  tags$div(class = paste("cvm-flag", klass), style = "margin-bottom:12px;",
+    tags$div(
+      tags$div(class = "label", htmlEscape(title)),
+      if (length(items) > 0) {
+        tags$ul(lapply(items, function(x) tags$li(htmlEscape(x))))
+      } else {
+        tags$p(style = "color:#5A6472;", "No changes to report.")
+      }
+    )
+  )
+}
+
+tagList(
+  ui_section_header("What shifted between the earliest and latest cohort"),
+  tags$div(class = "cvm-change-cards",
+    card("Most improved tags",  cn$improved,   "green"),
+    card("Tags at risk",         cn$at_risk,    "red"),
+    card("Consistent strengths", cn$consistent, "amber")
+  )
+)
+```
+
+# Curriculum Tag Coverage
+
+```{r}
+#| output: asis
+# See course_year_dashboard.qmd for why bare htmltools tags need the
+# `{=html}` raw-HTML fence. TL;DR: without it, pandoc re-parses <span> tags
+# as markdown inline text and they render as literal source.
+emit_html <- function(tag) {
+  if (is.null(tag)) return(invisible())
+  cat("\n```{=html}\n", as.character(tag), "\n```\n\n", sep = "")
+}
+
+cat("## {.tabset}\n\n")
+for (r in all_data) {
+  cat(sprintf("### %s\n\n", r$cohort_label))
+
+  # Wrap the whole per-cohort block in a .cvm-filterable div, same pattern
+  # as the Assessment Performance chunk.
+  keys <- cohort_period_keys(r)
+  emit_html(HTML(sprintf(
+    '<div class="cvm-filterable" data-period-keys="%s">',
+    htmlEscape(keys)
+  )))
+
+  tc <- r$tag_coverage
+  first <- if (!is.null(tc) && length(tc) > 0) tc[[1]] else NULL
+  if (is.null(first) || length(first) == 0) {
+    emit_html(ui_banner(
+      sprintf("No tag coverage data for %s.", htmlEscape(r$cohort_label)),
+      variant = "info"
+    ))
+    emit_html(HTML("</div>"))
+    next
+  }
+  cat("#### {.tabset}\n\n")
+  for (ts in names(first)) {
+    pretty <- pretty_tagset_name(ts)
+    cat(sprintf("##### %s\n\n", pretty))
+    dfs    <- lapply(tc, function(x) x[[ts]])
+    merged <- dplyr::bind_rows(Filter(Negate(is.null), dfs))
+    s      <- tag_coverage_summary(merged)
+    bar    <- tag_bar_plotly(merged, title = pretty)
+
+    emit_html(ui_coverage_strip(
+      s$covered, s$total, s$pct,
+      label = sprintf("%s covered", tolower(pretty))
+    ))
+
+    if (!is.null(r$tagset_plots[[ts]])) {
+      emit_html(ui_section_header("Coverage chart"))
+      print(plotly::ggplotly(r$tagset_plots[[ts]]) |>
+              plotly::config(displaylogo = FALSE))
+    }
+
+    emit_html(ui_section_header("Tag-by-tag counts"))
+    print(bar$plot)
+
+    emit_html(ui_deprecated_note(bar$deprecated_count))
+
+    emit_html(ui_section_header(sprintf("Uncovered tags (%d)", length(s$uncovered))))
+    emit_html(ui_tag_chips(s$uncovered))
+  }
+  # Close the .cvm-filterable wrapper for this cohort.
+  emit_html(HTML("</div>"))
+}
+```
+
+# Combined Narrative
+
+```{r}
+narr_path <- sub("\\.rds$", "_narrative.rds", params$all_data_path)
+narrative <- if (file.exists(narr_path)) readRDS(narr_path) else NULL
+
+if (is.null(narrative)) {
+  HTML('<div class="cvm-banner info">Narrative not generated for this render.</div>')
+} else if (isFALSE(narrative$available %||% TRUE)) {
+  HTML(paste0(
+    '<div class="cvm-narrative"><p>',
+    htmlEscape(narrative$narrative), '</p></div>'
+  ))
+} else {
+  flags_ui <- if (!is.null(narrative$flags) && nrow(narrative$flags) > 0) {
+    tagList(lapply(seq_len(nrow(narrative$flags)), function(i) {
+      f <- narrative$flags[i, ]
+      klass <- switch(f$severity,
+                      high   = "cvm-flag red",
+                      medium = "cvm-flag amber",
+                      low    = "cvm-flag green",
+                      "cvm-flag amber")
+      tags$div(class = klass,
+        tags$div(
+          tags$div(class = "label", toupper(f$severity)),
+          tags$div(class = "issue", f$issue),
+          tags$div(class = "rec",   f$recommendation)
+        )
+      )
+    }))
+  } else NULL
+
+  questions_ui <- if (length(narrative$questions) > 0) {
+    tags$ol(class = "cvm-questions", lapply(narrative$questions, tags$li))
+  } else NULL
+
+  tagList(
+    tags$div(class = "cvm-narrative", HTML(markdown_to_html(narrative$narrative))),
+    if (!is.null(flags_ui))     tagList(ui_section_header("Areas of concern"),     flags_ui),
+    if (!is.null(questions_ui)) tagList(ui_section_header("Questions to explore"), questions_ui),
+    tags$p(
+      style = "color:#5A6472; font-size:12px; margin-top:24px;",
+      sprintf("Generated %s using %s.",
+              fmt_ts(narrative$generated_at),
+              narrative$model %||% "—")
+    )
+  )
+}
+```
+
+```{r}
+#| include: false
+#| output: false
+# Serialize the filter-bar data and the bootstrap JS. This chunk intentionally
+# produces no visible output — the raw {=html} block below is what lands on
+# the page.
+```
+
+```{=html}
+<script id="cvm-dashboard-data" type="application/json">
+`r period_index_json`
+</script>
+<style>
+  /* Filter bar + state styling. Intentionally scoped via .cvm-* classes so it
+     doesn't collide with Quarto's Bootstrap layout. */
+  .cvm-filter-bar {
+    position: sticky;
+    top: 0;
+    z-index: 900;
+    background: #FFFFFF;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    padding: 12px 24px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    border-bottom: 1px solid #E0E4EC;
+    font-family: Inter, "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  .cvm-filter-bar .label {
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    color: #5A6472;
+  }
+  .cvm-filter-bar .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .cvm-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 14px;
+    border: 1px solid #003F6B;
+    border-radius: 20px;
+    background: #FFFFFF;
+    color: #003F6B;
+    font-size: 12px; font-weight: 500;
+    cursor: pointer; user-select: none;
+    transition: background 120ms, color 120ms;
+  }
+  .cvm-chip:hover { background: #EEF4FB; }
+  .cvm-chip.active { background: #003F6B; color: #FFFFFF; }
+  .cvm-chip:focus-visible {
+    outline: 2px solid #AB8B00; outline-offset: 2px;
+  }
+  .cvm-filter-actions { margin-left: auto; display: flex; gap: 14px; }
+  .cvm-filter-actions a {
+    color: #AB8B00; font-size: 13px; font-weight: 500;
+    cursor: pointer; text-decoration: none;
+    border-bottom: 1px dashed rgba(171,139,0,0.4);
+  }
+  .cvm-filter-actions a:hover { color: #003F6B; border-color: #003F6B; }
+  .cvm-filterable { transition: opacity 150ms; }
+</style>
+<script>
+(function() {
+  // ---- data -------------------------------------------------------------
+  const dataEl = document.getElementById('cvm-dashboard-data');
+  if (!dataEl) return;
+  let PERIODS;
+  try { PERIODS = JSON.parse(dataEl.textContent); }
+  catch (e) { console.error('CVM filter: could not parse data', e); return; }
+  if (!Array.isArray(PERIODS) || PERIODS.length === 0) return;
+
+  const STORAGE_KEY = 'cvm-dashboard-filter';
+  const ALL_IDS = PERIODS.map(p => p.id);
+
+  // ---- state ------------------------------------------------------------
+  let active;
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+    active = Array.isArray(saved)
+      ? new Set(saved.filter(id => ALL_IDS.includes(id)))
+      : new Set(ALL_IDS);
+    if (active.size === 0) active = new Set(ALL_IDS);
+  } catch (e) { active = new Set(ALL_IDS); }
+
+  function persist() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify([...active])); }
+    catch (e) { /* private-mode etc — ignore */ }
+  }
+
+  // ---- helpers ----------------------------------------------------------
+  function median(xs) {
+    if (xs.length === 0) return null;
+    const s = [...xs].sort((a,b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m-1] + s[m]) / 2;
+  }
+  function selectedPeriods() {
+    return PERIODS.filter(p => active.has(p.id));
+  }
+  function recomputeKpis() {
+    const sel = selectedPeriods();
+    const medians = sel.map(p => p.median).filter(v => typeof v === 'number');
+    const students = sel.reduce((s, p) => s + (p.students || 0), 0);
+    const periods  = sel.length;
+    const tagSets  = sel.reduce((m, p) => Math.max(m, p.n_tag_sets || 0), 0);
+
+    setKpi('median',   medians.length ? median(medians).toFixed(1) : '—');
+    setKpi('students', students);
+    setKpi('periods',  periods);
+    setKpi('tag_sets', tagSets);
+  }
+  function setKpi(key, val) {
+    document.querySelectorAll('[data-kpi="' + key + '"] .cvm-kpi-value').forEach(el => {
+      el.textContent = String(val);
+    });
+  }
+  function apply() {
+    // Chip visual state
+    document.querySelectorAll('.cvm-chip').forEach(chip => {
+      chip.classList.toggle('active', active.has(chip.dataset.periodId));
+      chip.setAttribute('aria-pressed', active.has(chip.dataset.periodId) ? 'true' : 'false');
+    });
+    // Filterable content blocks
+    document.querySelectorAll('.cvm-filterable').forEach(el => {
+      const keys = (el.dataset.periodKeys || '').split(/\s+/).filter(Boolean);
+      const match = keys.length === 0 ? true : keys.some(k => active.has(k));
+      el.style.display = match ? '' : 'none';
+    });
+    recomputeKpis();
+  }
+
+  // ---- build the bar ----------------------------------------------------
+  function build() {
+    const nav = document.querySelector('.quarto-dashboard .navbar')
+             || document.querySelector('header.navbar')
+             || document.querySelector('nav');
+    if (!nav) { console.warn('CVM filter: no navbar anchor found'); return; }
+
+    const bar = document.createElement('div');
+    bar.className = 'cvm-filter-bar';
+    bar.setAttribute('role', 'toolbar');
+    bar.setAttribute('aria-label', 'Filter by graduating class and period');
+
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = 'Periods';
+    bar.appendChild(label);
+
+    const chipsWrap = document.createElement('div');
+    chipsWrap.className = 'chips';
+    PERIODS.forEach(p => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'cvm-chip';
+      chip.dataset.periodId = p.id;
+      chip.setAttribute('aria-pressed', 'false');
+      chip.textContent = p.label;
+      chip.addEventListener('click', () => {
+        if (active.has(p.id)) active.delete(p.id);
+        else active.add(p.id);
+        if (active.size === 0) active = new Set(ALL_IDS);
+        persist(); apply();
+      });
+      chipsWrap.appendChild(chip);
+    });
+    bar.appendChild(chipsWrap);
+
+    const actions = document.createElement('div');
+    actions.className = 'cvm-filter-actions';
+    const selAll = document.createElement('a');
+    selAll.textContent = 'Select all';
+    selAll.setAttribute('role', 'button'); selAll.setAttribute('tabindex', '0');
+    selAll.addEventListener('click', () => { active = new Set(ALL_IDS); persist(); apply(); });
+    const clear = document.createElement('a');
+    clear.textContent = 'Clear';
+    clear.setAttribute('role', 'button'); clear.setAttribute('tabindex', '0');
+    clear.addEventListener('click', () => {
+      // "Clear" is really "single-period view"-lite: empty => reset to all.
+      active = new Set(); persist(); apply();
+      setTimeout(() => {
+        if (active.size === 0) { active = new Set(ALL_IDS); persist(); apply(); }
+      }, 3000);
+    });
+    actions.appendChild(selAll); actions.appendChild(clear);
+    bar.appendChild(actions);
+
+    nav.parentNode.insertBefore(bar, nav.nextSibling);
+  }
+
+  // ---- init ------------------------------------------------------------
+  // Multiple triggers because Quarto's dashboard layout JS can reorder DOM
+  // after DOMContentLoaded — apply() needs to run AFTER the final DOM state.
+  // Each trigger wrapped in try/catch so one failure doesn't kill the others.
+  let hasInit = false;
+  function runOnce() {
+    if (hasInit) { try { apply(); } catch (e) { console.error('CVM filter: apply() failed', e); } return; }
+    hasInit = true;
+    try { build(); } catch (e) { console.error('CVM filter: build() failed', e); }
+    try {
+      apply();
+      console.log('CVM filter: initial apply OK, ' + PERIODS.length + ' periods, active=' + active.size);
+      // Verify KPI elements exist — log a warning if not (usually means DOM
+      // wasn't ready or selectors don't match Quarto's actual output).
+      ['median','students','periods','tag_sets'].forEach(k => {
+        const n = document.querySelectorAll('[data-kpi="' + k + '"] .cvm-kpi-value').length;
+        if (n === 0) console.warn('CVM filter: no element for data-kpi="' + k + '"');
+      });
+    } catch (e) { console.error('CVM filter: apply() failed', e); }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', runOnce);
+  } else {
+    runOnce();
+  }
+  // Second call on window.load — catches DOM changes made after
+  // DOMContentLoaded by Quarto's dashboard JS or htmlwidgets.
+  window.addEventListener('load', () => { try { apply(); } catch (e) { console.error('CVM filter: window.load apply() failed', e); } });
+  // Third call on a 300ms timer — belt and suspenders for late dom mutations.
+  setTimeout(() => { try { apply(); } catch (e) { /* swallow */ } }, 300);
+})();
+</script>
+```
