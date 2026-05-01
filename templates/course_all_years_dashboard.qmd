@@ -2,9 +2,11 @@
 format:
   dashboard:
     embed-resources: false
+    scrolling: true
     theme:
       - default
       - lib/custom.scss
+    include-in-header: "../www/cvm-spacing.html"
     nav-buttons: []
     orientation: rows
 params:
@@ -81,6 +83,21 @@ total_students  <- sum(vapply(all_data, function(r) r$kpi$total_students  %||% 0
 total_periods   <- sum(vapply(all_data, function(r) r$kpi$periods_covered %||% 0L, integer(1)))
 n_tag_sets_max  <- max(vapply(all_data, function(r) r$kpi$n_tag_sets %||% 0L, integer(1)), 0L)
 
+# Pooled IQR — quartiles of every cohort's capped grade values pooled
+# together. Drives the hero KPI subvalue so the median + IQR tell the
+# same distributional story.
+pooled_grades <- unlist(lapply(all_data, function(r) {
+  if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) || nrow(r$grades_df) == 0) {
+    return(numeric(0))
+  }
+  g_col <- if ("grade_display" %in% names(r$grades_df)) {
+    r$grades_df$grade_display
+  } else r$grades_df$grade
+  g_col[is.finite(g_col)]
+}), use.names = FALSE)
+pooled_q1 <- if (length(pooled_grades)) as.numeric(stats::quantile(pooled_grades, 0.25, na.rm = TRUE)) else NA_real_
+pooled_q3 <- if (length(pooled_grades)) as.numeric(stats::quantile(pooled_grades, 0.75, na.rm = TRUE)) else NA_real_
+
 # ---- per-cohort precomputed frames (used by Assessment Performance tab) ----
 cohort_trends <- lapply(all_data, function(r) {
   if (!isTRUE(r$gradebook_ok)) return(NULL)
@@ -116,13 +133,19 @@ period_labels <- stats::setNames(
 )
 
 # cohort_stats: per-cohort summary rows below the trend chart.
+# Stats use the capped `grade_display` column (extra-credit weighted formulas
+# can push raw grades above 100; capping at 100 avoids nonsense medians).
+# The capping flag (`had_grade_capping` on each cohort) drives the asterisk
+# + footnote in the Overview cohort summary table.
 cohort_stats <- dplyr::bind_rows(lapply(names(all_data), function(lab) {
   r <- all_data[[lab]]
   if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) || nrow(r$grades_df) == 0) {
     return(tibble::tibble(
-      Cohort = lab, Median = NA_real_, Mean = NA_real_,
-      SD = NA_real_, Min = NA_real_, Max = NA_real_,
-      N = 0L, `% ≥ 90` = NA_real_, `% ≥ 80` = NA_real_,
+      Cohort = lab, Median = NA_real_,
+      Q1 = NA_real_, Q3 = NA_real_,
+      Mean = NA_real_, SD = NA_real_,
+      N = 0L, `% ≥ 90` = NA_real_, `% ≥ 80` = NA_real_, `% < 70` = NA_real_,
+      Capped = FALSE,
       .rows = 1
     ))
   }
@@ -131,17 +154,22 @@ cohort_stats <- dplyr::bind_rows(lapply(names(all_data), function(lab) {
     dplyr::filter(.data$assessment %in% c("weighted_overall_grade",
                                           "individual_weighted_overall"))
   df <- if (nrow(final) > 0) final else r$grades_df
-  g <- df$grade[!is.na(df$grade)]
+  g_raw <- df$grade
+  g_col <- if ("grade_display" %in% names(df)) df$grade_display else pmin(g_raw, 100)
+  g <- g_col[!is.na(g_col)]
   tibble::tibble(
     Cohort   = lab,
     Median   = stats::median(g),
+    Q1       = as.numeric(stats::quantile(g, 0.25, na.rm = TRUE)),
+    Q3       = as.numeric(stats::quantile(g, 0.75, na.rm = TRUE)),
     Mean     = mean(g),
     SD       = stats::sd(g),
-    Min      = min(g),
-    Max      = max(g),
     N        = dplyr::n_distinct(df$id),
     `% ≥ 90` = 100 * mean(g >= 90),
-    `% ≥ 80` = 100 * mean(g >= 80)
+    `% ≥ 80` = 100 * mean(g >= 80),
+    `% < 70` = 100 * mean(g <  70),
+    Capped   = isTRUE(r$had_grade_capping) ||
+               any(g_raw > 100, na.rm = TRUE)
   )
 }))
 
@@ -174,6 +202,69 @@ tag_set_names <- if (!is.null(primary$tag_coverage) && length(primary$tag_covera
 
 # Chip list order for sidebar display (pretty names).
 tag_set_pretty <- if (length(tag_set_names) > 0) pretty_tagset_name(tag_set_names) else character(0)
+
+# ---- Download-button helpers ---------------------------------------------
+# A render-stable slug used for every PNG/CSV/Excel filename so a folder of
+# downloads from one render groups together cleanly.
+ts_slug <- gsub("[^A-Za-z0-9]", "_", render_ts)
+
+# Common plotly::config() block — adds the toolbar's PNG-export camera and
+# trims the lasso/select tools we don't use. Pass the resulting list with
+# do.call(plotly::config, c(list(p), cvm_plotly_config_args())).
+cvm_plotly_config_args <- function(filename_tag = "chart", height = 600, width = 1200) {
+  list(
+    displaylogo            = FALSE,
+    responsive             = TRUE,
+    toImageButtonOptions   = list(
+      format   = "png",
+      filename = sprintf("%s_%s_%s", primary$course_code, filename_tag, ts_slug),
+      height   = height,
+      width    = width,
+      scale    = 2
+    ),
+    modeBarButtonsToAdd    = list("toImage"),
+    modeBarButtonsToRemove = list("lasso2d", "select2d")
+  )
+}
+
+# Common DT options block — turns on Buttons extension with CSV + Excel
+# exports. The buttons land in the table's top toolbar (dom = "Bfrtip").
+cvm_dt_buttons <- function(filename_tag = "table") {
+  # Compact icon-style labels — "↓ CSV" / "↓ Excel" — kept right-aligned
+  # via .dt-buttons CSS in the trailing style block (Brand Guardian: don't
+  # let download chrome compete visually with the table data).
+  list(
+    list(extend = "csv",
+         text   = "↓ CSV",
+         filename = sprintf("%s_%s", primary$course_code, filename_tag)),
+    list(extend = "excel",
+         text   = "↓ Excel",
+         filename = sprintf("%s_%s", primary$course_code, filename_tag))
+  )
+}
+
+# Tag-coverage data, serialized as JSON for the heatmap CSV-download
+# button. Built once at setup time and injected into the rendered HTML
+# via the trailing raw-HTML block.
+tag_data_json <- if (length(tag_set_names) > 0) {
+  jsonlite::toJSON(
+    stats::setNames(
+      lapply(tag_set_names, function(ts) {
+        stats::setNames(
+          lapply(all_data, function(r) {
+            if (is.null(r$tag_coverage) || length(r$tag_coverage) == 0) return(list())
+            merged <- dplyr::bind_rows(Filter(Negate(is.null),
+                                              lapply(r$tag_coverage, function(x) x[[ts]])))
+            as.list(tagset_counts_vec(merged))
+          }),
+          names(all_data)
+        )
+      }),
+      tag_set_names
+    ),
+    auto_unbox = TRUE
+  )
+} else "{}"
 ```
 
 ---
@@ -215,7 +306,9 @@ tagList(
     ui_kpi_card(
       label    = "Pooled median grade (%)",
       value    = if (any(!is.na(overall_medians))) sprintf("%.1f", median(overall_medians, na.rm = TRUE)) else "—",
-      subvalue = "Across selected cohorts",
+      subvalue = if (is.finite(pooled_q1) && is.finite(pooled_q3)) {
+                   sprintf("IQR: %.1f – %.1f", pooled_q1, pooled_q3)
+                 } else "Across selected cohorts",
       kpi_key  = "median"
     ),
     ui_kpi_card(
@@ -240,38 +333,48 @@ tagList(
 )
 ```
 
+## Row
+
 ```{r}
 #| title: "Cohort summary"
-# One row per cohort: colored dot + label + individual median / students.
+# One row per cohort. Median is rendered as a string ("95.4") — never with
+# an asterisk on the value or the cohort name. The single capping footnote
+# at the bottom of the Overview tab carries the disclaimer instead.
+# Numeric columns go through DT::formatRound for consistent 1-decimal display.
 rows <- lapply(names(all_data), function(lab) {
   r <- all_data[[lab]]
   col <- cohort_color_for(lab)
-  # Pull per-cohort stats we already computed in the setup chunk — keeps a
-  # single source of truth with the Assessment Performance stats card.
   stat <- cohort_stats[cohort_stats$Cohort == lab, , drop = FALSE]
   take_num <- function(col_name) {
     if (nrow(stat) == 0) return(NA_real_)
     v <- stat[[col_name]]
     if (length(v) == 0 || !is.finite(v[[1]])) NA_real_ else round(as.numeric(v[[1]]), 1)
   }
+  med_num <- take_num("Median")
+  median_display <- if (is.na(med_num)) "—" else sprintf("%.1f", med_num)
+  q1_num <- take_num("Q1"); q3_num <- take_num("Q3")
+  iqr_display <- if (is.na(q1_num) || is.na(q3_num)) "—"
+                 else sprintf("%.1f – %.1f", q1_num, q3_num)
   data.frame(
-    Cohort       = lab,
-    Color        = col,
-    Median       = take_num("Median"),
-    Mean         = take_num("Mean"),
-    SD           = take_num("SD"),
-    Min          = take_num("Min"),
-    Max          = take_num("Max"),
-    `N Students` = as.integer(r$kpi$total_students  %||% 0L),
-    `% ≥ 90`     = take_num("% ≥ 90"),
-    `% ≥ 80`     = take_num("% ≥ 80"),
-    Periods      = as.integer(r$kpi$periods_covered %||% 0L),
-    `Tag Sets`   = as.integer(r$kpi$n_tag_sets       %||% 0L),
-    check.names  = FALSE,
+    Cohort         = lab,
+    Color          = col,
+    Median         = median_display,
+    `IQR (Q1–Q3)`  = iqr_display,
+    Mean           = take_num("Mean"),
+    SD             = take_num("SD"),
+    `% ≥ 90`       = take_num("% ≥ 90"),
+    `% ≥ 80`       = take_num("% ≥ 80"),
+    `% < 70`       = take_num("% < 70"),
+    N              = as.integer(r$kpi$total_students  %||% 0L),
+    Periods        = as.integer(r$kpi$periods_covered %||% 0L),
+    `Tag Sets`     = as.integer(r$kpi$n_tag_sets       %||% 0L),
+    check.names    = FALSE,
     stringsAsFactors = FALSE
   )
 })
 summary_df <- do.call(rbind, rows)
+any_capped <- any(vapply(all_data, function(r) isTRUE(r$had_grade_capping),
+                         logical(1)))
 # Cohort cell = colored dot + label. The containing <tr> is NOT wrapped in
 # .cvm-filterable (DT rebuilds rows dynamically, and hiding rows via the
 # filter JS would break DT's rendering). The chip filter bar drives the OTHER
@@ -283,25 +386,34 @@ summary_df$Cohort <- mapply(function(lab, col) {
 }, summary_df$Cohort, summary_df$Color, USE.NAMES = FALSE)
 summary_df$Color <- NULL
 
-# Spec-ordered columns: Cohort, Median, Mean, SD, Min, Max, N Students,
-# % ≥ 90, % ≥ 80, Periods, Tag Sets.
-summary_df <- summary_df[, c("Cohort", "Median", "Mean", "SD", "Min", "Max",
-                             "N Students", "% ≥ 90", "% ≥ 80",
-                             "Periods", "Tag Sets"), drop = FALSE]
+# Spec-ordered columns: Cohort, Median, IQR (Q1–Q3), Mean, SD,
+# % ≥ 90, % ≥ 80, % < 70, N, Periods, Tag Sets. Min/Max removed —
+# they were misleading under extra-credit-inflated weighted formulas
+# even after capping (a single 100 made every cohort look identical at
+# the top end). IQR is the spread metric we want to report.
+summary_df <- summary_df[, c("Cohort", "Median", "IQR (Q1–Q3)",
+                             "Mean", "SD",
+                             "% ≥ 90", "% ≥ 80", "% < 70",
+                             "N", "Periods", "Tag Sets"), drop = FALSE]
 
-numeric_cols <- c("Median", "Mean", "SD", "Min", "Max",
-                  "N Students", "% ≥ 90", "% ≥ 80", "Periods", "Tag Sets")
-numeric_col_idx0 <- which(names(summary_df) %in% numeric_cols) - 1L
+# Median and IQR (Q1–Q3) are character columns; everything else stays
+# numeric and goes through DT::formatRound for 1-decimal display.
+numeric_cols <- c("Mean", "SD", "% ≥ 90", "% ≥ 80", "% < 70",
+                  "N", "Periods", "Tag Sets")
+right_align_idx0 <- which(names(summary_df) %in% c("Median", "IQR (Q1–Q3)",
+                                                   numeric_cols)) - 1L
 
-DT::datatable(
+dt_widget <- DT::datatable(
   summary_df,
   rownames = FALSE,
   escape   = FALSE,
+  extensions = "Buttons",
   options  = list(
-    dom = "t", pageLength = 20, ordering = FALSE, scrollX = FALSE,
+    dom = "Bfrtip", pageLength = 20, ordering = FALSE, scrollX = FALSE,
+    buttons = cvm_dt_buttons("cohort_summary"),
     columnDefs = list(
       list(targets = 0, className = "dt-left"),
-      list(targets = numeric_col_idx0, className = "dt-right")
+      list(targets = right_align_idx0, className = "dt-right")
     ),
     initComplete = DT::JS(
       "function(settings, json) {",
@@ -315,10 +427,27 @@ DT::datatable(
     )
   )
 ) |>
-  # All numeric columns to 1 decimal (integer counts like N/Periods/Tag Sets
-  # are stored as integers and display without decimals via DT's int path).
-  DT::formatRound(columns = c("Median", "Mean", "SD", "Min", "Max",
-                              "% ≥ 90", "% ≥ 80"), digits = 1)
+  DT::formatRound(columns = c("Mean", "SD",
+                              "% ≥ 90", "% ≥ 80", "% < 70"), digits = 1)
+
+dt_widget
+```
+
+```{r}
+#| title: "Notes"
+# Overview-only footer. Single capping disclaimer lives here so the table
+# itself stays clean. Renders nothing when no cohort triggered the cap.
+if (isTRUE(any_capped)) {
+  htmltools::tags$p(
+    style = "font-size:12px;color:#5A6472;margin:8px 0 0 0;font-style:italic;",
+    "Grades are capped at 100 for display. Original weighted formula included extra credit above 100% in some cohorts; capping affects display statistics only and not the underlying data."
+  )
+} else {
+  htmltools::tags$p(
+    style = "display:none;",
+    ""
+  )
+}
 ```
 
 # Assessment Performance
@@ -341,11 +470,73 @@ section_head <- function(title, desc) {
   )
 }
 
+# ── Section 0: Box plot of grade distribution by cohort ─────────────────
+# Renders FIRST in Assessment Performance — gives the complete distributional
+# picture (median, quartiles, outliers) for every cohort at a glance. The
+# histograms in Section 2 follow below for granular shape detail.
+s0_widget <- {
+  any_grades <- any(vapply(names(all_data), function(lab) {
+    r <- all_data[[lab]]
+    isTRUE(r$gradebook_ok) && !is.null(r$grades_df) && nrow(r$grades_df) > 0
+  }, logical(1)))
+  if (!any_grades) {
+    ui_banner("No gradebook data available for any cohort.", variant = "info")
+  } else {
+    box_plot <- plotly::plot_ly(height = 360)
+    for (lab in names(all_data)) {
+      r <- all_data[[lab]]
+      if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) ||
+          nrow(r$grades_df) == 0) next
+      final <- r$grades_df |>
+        dplyr::filter(.data$assessment %in% c("weighted_overall_grade",
+                                              "individual_weighted_overall"))
+      df <- if (nrow(final) > 0) final else r$grades_df
+      g_col <- if ("grade_display" %in% names(df)) df$grade_display
+               else pmin(df$grade, 100)
+      g <- g_col[is.finite(g_col)]
+      if (length(g) == 0) next
+      col <- cohort_color_for(lab)
+      box_plot <- box_plot |>
+        plotly::add_trace(
+          type      = "box",
+          y         = g,
+          name      = lab,
+          marker    = list(color = col),
+          line      = list(color = col),
+          fillcolor = paste0(col, "33"),
+          boxpoints = "outliers",
+          hovertemplate = paste0(lab, "<br>Median: %{median}<br>",
+                                 "Q1: %{q1}<br>Q3: %{q3}<extra></extra>")
+        )
+    }
+    box_plot <- box_plot |>
+      plotly::layout(
+        title = list(text = "Grade distribution by cohort — box plot",
+                     font = list(color = CVM_PALETTE$navy, size = 14)),
+        yaxis = list(title = "Grade (%)", range = c(0, 105),
+                     gridcolor = "#E4E7EC"),
+        xaxis = list(title = ""),
+        paper_bgcolor = "white", plot_bgcolor = "white",
+        font = list(family = "Inter, sans-serif", color = CVM_PALETTE$text),
+        margin = list(t = 50, b = 60, l = 60, r = 40),
+        showlegend = TRUE,
+        legend = list(orientation = "h", y = -0.2)
+      )
+    box_plot <- do.call(plotly::config,
+                        c(list(box_plot),
+                          cvm_plotly_config_args(filename_tag = "grade_box_plot",
+                                                 height = 600, width = 1200)))
+    ui_plot_box(box_plot, height = 380)
+  }
+}
+
 # ── Section 1: Grade Performance by Cohort ──────────────────────────────
 s1_widget <- if (nrow(cohort_stats) == 0) {
   ui_banner("No gradebook data available for any cohort.", variant = "info")
 } else {
-  stats_df <- cohort_stats
+  # Capped is an internal helper column for the Overview footnote — never
+  # surface it in the Assessment Performance grid.
+  stats_df <- cohort_stats[, setdiff(names(cohort_stats), "Capped"), drop = FALSE]
   stats_df$Cohort <- vapply(stats_df$Cohort, function(lab) {
     col <- cohort_color_for(lab)
     sprintf('<span style="display:inline-block;width:10px;height:10px;border-radius:50%%;background:%s;margin-right:8px;vertical-align:middle;"></span>%s',
@@ -355,8 +546,10 @@ s1_widget <- if (nrow(cohort_stats) == 0) {
   numeric_cols_0idx <- which(!names(stats_df) %in% "Cohort") - 1L
   DT::datatable(
     stats_df, rownames = FALSE, escape = FALSE,
+    extensions = "Buttons",
     options = list(
-      dom = "t", pageLength = 20, scrollX = FALSE, ordering = FALSE,
+      dom = "Bfrtip", pageLength = 20, scrollX = FALSE, ordering = FALSE,
+      buttons = cvm_dt_buttons("grade_performance"),
       columnDefs = list(
         list(targets = numeric_cols_0idx, className = "dt-right"),
         list(targets = 0, width = "200px")
@@ -377,8 +570,8 @@ s1_widget <- if (nrow(cohort_stats) == 0) {
       )
     )
   ) |>
-    DT::formatRound(columns = c("Median", "Mean", "SD", "Min", "Max",
-                                "% ≥ 90", "% ≥ 80"), digits = 1)
+    DT::formatRound(columns = c("Median", "Q1", "Q3", "Mean", "SD",
+                                "% ≥ 90", "% ≥ 80", "% < 70"), digits = 1)
 }
 
 # ── Section 2: Grade Distribution by Cohort ─────────────────────────────
@@ -395,7 +588,7 @@ s2_widget <- if (length(cohorts_with_data) == 0) {
       tags$div(
         class = "cvm-filterable cvm-histogram-card",
         `data-cohort-labels` = lab,
-        style = "background:#fff;border:1px solid #E0E4EC;border-radius:12px;padding:16px;position:relative;height:360px;overflow:hidden;",
+        style = "background:#fff;border:1px solid #E0E4EC;border-radius:12px;padding:16px;position:relative;min-height:500px;height:auto;overflow:visible;",
         tags$div(
           style = "display:flex;align-items:center;gap:8px;margin-bottom:8px;",
           tags$span(style = sprintf(
@@ -406,13 +599,17 @@ s2_widget <- if (length(cohorts_with_data) == 0) {
             lab)
         ),
         ui_plot_box(
-          plotly::ggplotly(
-            distribution_plot(r$grades_df,
-                              title = sprintf("Distribution — %s", lab),
-                              cohort_color = col),
-            height = 320
-          ) |> plotly::config(displaylogo = FALSE, responsive = TRUE),
-          height = 340
+          do.call(plotly::config, c(
+            list(plotly::ggplotly(
+              distribution_plot(r$grades_df,
+                                title = sprintf("Distribution — %s", lab),
+                                cohort_color = col),
+              height = 460
+            )),
+            cvm_plotly_config_args(filename_tag = sprintf("distribution_%s",
+                                                          gsub("[^A-Za-z0-9]", "_", lab)))
+          )),
+          height = 460
         )
       )
     })
@@ -475,7 +672,7 @@ s4_widget <- if (nrow(cohort_breakdown_df) == 0) {
     wide, rownames = FALSE, escape = FALSE,
     extensions = "Buttons",
     options = list(
-      dom = "Bfrtip", buttons = c("csv"),
+      dom = "Bfrtip", buttons = cvm_dt_buttons("assessment_breakdown"),
       pageLength = 50, scrollX = FALSE, ordering = TRUE,
       columnDefs = list(
         list(targets = type_col_idx,   width = "130px", className = "dt-left"),
@@ -496,72 +693,7 @@ s4_widget <- if (nrow(cohort_breakdown_df) == 0) {
   )
 }
 
-# ── Section 5: Cohort Aggregate Statistics ──────────────────────────────
-s5_widget <- if (length(all_data) == 0) {
-  ui_banner("No gradebook data available for any cohort.", variant = "info")
-} else {
-  aggregate_rows <- lapply(names(all_data), function(lab) {
-    r <- all_data[[lab]]
-    col <- cohort_color_for(lab)
-    cohort_cell <- sprintf(
-      '<span style="display:inline-block;width:10px;height:10px;border-radius:50%%;background:%s;margin-right:8px;vertical-align:middle;"></span>%s',
-      col, htmlEscape(lab)
-    )
-    if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) || nrow(r$grades_df) == 0) {
-      return(data.frame(
-        Cohort = cohort_cell,
-        Median = NA_real_, Mean = NA_real_, SD = NA_real_,
-        Min = NA_real_, Max = NA_real_, N = 0L,
-        `% ≥ 80` = NA_real_, `% ≥ 90` = NA_real_, `% ≥ 95` = NA_real_,
-        check.names = FALSE, stringsAsFactors = FALSE
-      ))
-    }
-    final <- r$grades_df |>
-      dplyr::filter(.data$assessment %in% c("weighted_overall_grade",
-                                            "individual_weighted_overall"))
-    df <- if (nrow(final) > 0) final else r$grades_df
-    g <- df$grade[is.finite(df$grade)]
-    data.frame(
-      Cohort = cohort_cell,
-      Median = round(stats::median(g), 1),
-      Mean   = round(mean(g), 1),
-      SD     = round(stats::sd(g), 2),
-      Min    = round(min(g), 1),
-      Max    = round(max(g), 1),
-      N      = as.integer(dplyr::n_distinct(df$id)),
-      `% ≥ 80` = round(100 * mean(g >= 80), 1),
-      `% ≥ 90` = round(100 * mean(g >= 90), 1),
-      `% ≥ 95` = round(100 * mean(g >= 95), 1),
-      check.names = FALSE, stringsAsFactors = FALSE
-    )
-  })
-  aggregate_df <- do.call(rbind, aggregate_rows)
-  num_cols_0idx <- which(names(aggregate_df) != "Cohort") - 1L
-  DT::datatable(
-    aggregate_df, rownames = FALSE, escape = FALSE,
-    options = list(
-      dom = "t", pageLength = 20, scrollX = FALSE, ordering = FALSE,
-      columnDefs = list(
-        list(targets = 0,             className = "dt-left", width = "220px"),
-        list(targets = num_cols_0idx, className = "dt-right")
-      ),
-      initComplete = DT::JS(
-        "function(settings, json) {",
-        "  $(this.api().table().header()).find('th').css({",
-        "    'background-color': '#003F6B',",
-        "    'color':            '#FFFFFF',",
-        "    'font-weight':      '600'",
-        "  });",
-        "}"
-      ),
-      rowCallback = DT::JS(
-        "function(row, data, dispIndex) {",
-        "  if (dispIndex % 2 === 1) { $(row).css('background-color', '#F9FAFB'); }",
-        "}"
-      )
-    )
-  )
-}
+# Section 5 removed — duplicated Overview cohort summary + Section 1.
 
 # ── Compose: stack the five sections vertically ─────────────────────────
 # Each section is a white card per spec: width:100%;display:block;clear:both;
@@ -577,6 +709,15 @@ card_style <- paste0(
 )
 
 tagList(
+  tags$div(
+    class = "cvm-card",
+    style = card_style,
+    section_head(
+      "Grade Distribution Overview",
+      "Box plot of final grades per cohort — median (center line), IQR (box), and outliers in one view. Histograms below show the shape in more detail."
+    ),
+    s0_widget
+  ),
   tags$div(
     class = "cvm-card",
     style = card_style,
@@ -613,15 +754,8 @@ tagList(
     ),
     s4_widget
   ),
-  tags$div(
-    class = "cvm-card",
-    style = card_style,
-    section_head(
-      "Cohort Aggregate Statistics",
-      "Full descriptive statistics per cohort, including pass-rate cuts at 80 / 90 / 95%."
-    ),
-    s5_widget
-  )
+  # Section 5 (Cohort Aggregate Statistics) intentionally removed —
+  # duplicated the Overview cohort summary + Section 1 stats table.
 )
 ```
 
@@ -784,10 +918,12 @@ if (length(tag_set_names) == 0) {
       )
     }
 
-    # Bar chart: larger min height + more margin for readable tag labels.
-    bar <- tag_bar_plotly_multi(
+    # Package-style plot: dodged vertical bars, rotated x labels — matches
+    # the look of cvm.course.portfolio::generate_tagset_plots() shipped in
+    # the PPT export. Converted to plotly for interactivity.
+    bar <- tag_pkg_style_plotly_multi(
       cohort_counts, cohort_colors, title = pretty,
-      height = max(500, 80 + 26 * length(all_tags_any))
+      height = max(600, 100 + 28 * length(all_tags_any))
     )
 
     # Heatmap — rebuilt as htmltools grid (see render_tag_heatmap above).
@@ -855,11 +991,17 @@ if (length(tag_set_names) == 0) {
       ),
       tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:8px;", "Coverage by cohort"),
       lapply(names(all_data), coverage_row),
-      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:24px;", "Tag-by-tag counts (grouped bar chart)"),
-      ui_plot_box(bar$plot, height = max(520, 100 + 26 * length(all_tags_any))),
+      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:24px;", "Tag coverage by component"),
+      tags$button(
+        onclick = sprintf(
+          "downloadTagsetCSV('%s', '%s')",
+          htmlEscape(ts), htmlEscape(pretty)
+        ),
+        style = "float:right;margin:0 0 8px 0;padding:4px 10px;background:#FFFFFF;border:1px solid #C7CDD6;color:#003F6B;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;",
+        "↓ CSV"
+      ),
+      ui_plot_box(bar$plot, height = max(600, 100 + 28 * length(all_tags_any))),
       ui_deprecated_note(bar$deprecated_count),
-      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:24px;", "Coverage heatmap — counts per cohort"),
-      heatmap_ui,
       uncovered_ui
     )
   }
@@ -914,50 +1056,57 @@ if (length(all_data) < 2) {
   top_v <- top_variable_tags(tag_stats, 5)
 
   # ---------- 1. Grade trajectory ----------
+  # Trajectory now reports `% ≥ 80` as the primary metric — directly
+  # measures competency and is unaffected by extra-credit-inflated weighted
+  # formulas. Median is shown as a secondary line for context. Delta is in
+  # percentage points (pp) vs the previous cohort. No more anomaly arrows /
+  # scale warnings — the grade-capping note belongs in Assessment
+  # Performance where raw grades are surfaced.
   trajectory_ui <- {
     rows <- lapply(seq_len(nrow(traj)), function(i) {
       row <- traj[i, ]
       col <- cohort_color_for(row$cohort)
       trend <- row$trend
-      # "anomaly" = this cohort's own median > 100 (extra-credit scale).
-      # We surface it explicitly rather than producing a nonsense delta.
       arrow <- switch(trend %||% "NA",
                       up      = "▲",
                       down    = "▼",
                       stable  = "▬",
-                      anomaly = "⚠",
                       "—")
       arrow_color <- switch(trend %||% "NA",
                             up      = CVM_PALETTE$success,
                             down    = CVM_PALETTE$warning,
                             stable  = CVM_PALETTE$muted,
-                            anomaly = CVM_PALETTE$alert,
                             CVM_PALETTE$muted)
-      delta_text <- if (identical(trend, "anomaly")) {
-        "Scale anomaly — median > 100% (extra-credit-inflated)"
-      } else if (is.na(row$delta)) {
-        "(no valid prior cohort)"
+      pct_text <- if (is.na(row$pct_80)) "—"
+                  else sprintf("%.1f%% at ≥ 80", row$pct_80)
+      med_text <- if (is.na(row$median)) ""
+                  else sprintf("Median %.1f", row$median)
+      delta_text <- if (is.na(row$delta)) {
+        "(no prior cohort baseline)"
       } else {
-        sprintf("%+.1f vs %s",
+        sprintf("%+.1fpp vs %s",
                 row$delta,
                 sub("^Class of ", "GC",
                     substr(row$prev_cohort,
                            nchar(row$prev_cohort) - 3,
                            nchar(row$prev_cohort))))
       }
-      # Trajectory rows live inside a white .cvm-card, so the row itself
-      # is transparent with a subtle bottom border — matches tag-coverage
-      # rows visually.
       tags$div(
-        style = "display:grid;grid-template-columns:20px 180px 40px 140px 1fr;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid #F0F0F0;",
+        style = "display:grid;grid-template-columns:20px 180px 40px 1fr 1fr;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid #F0F0F0;",
         tags$span(style = sprintf(
           "display:inline-block;width:14px;height:14px;border-radius:50%%;background:%s;", col
         )),
         tags$span(style = "font-weight:600;color:#003F6B;white-space:nowrap;", row$cohort),
         tags$span(style = sprintf("font-size:22px;font-weight:700;color:%s;text-align:center;", arrow_color), arrow),
-        tags$span(style = "color:#1A1A2E;white-space:nowrap;font-variant-numeric:tabular-nums;",
-                  sprintf("Median %.1f", row$median)),
-        tags$span(style = sprintf("font-size:12px;color:%s;", arrow_color), delta_text)
+        tags$div(
+          tags$div(style = "font-size:18px;font-weight:700;color:#1A1A2E;font-variant-numeric:tabular-nums;",
+                   pct_text),
+          tags$div(style = "font-size:11px;color:#5A6472;font-variant-numeric:tabular-nums;",
+                   med_text)
+        ),
+        tags$span(style = sprintf("font-size:12px;color:%s;font-variant-numeric:tabular-nums;",
+                                  arrow_color),
+                  delta_text)
       )
     })
     rows
@@ -966,22 +1115,33 @@ if (length(all_data) < 2) {
   # ---------- 2. Consistency score ----------
   cv_display <- if (is.null(consistency$cv) || is.na(consistency$cv)) "—"
                 else sprintf("%.2f%%", consistency$cv)
+  # Color semantics now match CV-direct labels: Low CV → green (stable),
+  # Medium → amber, High → red (inconsistent). The labels match the
+  # interpretation guide rendered below.
   consistency_bar <- switch(consistency$label,
-                            High   = CVM_PALETTE$success,
+                            Low    = CVM_PALETTE$success,
                             Medium = CVM_PALETTE$warning,
-                            Low    = CVM_PALETTE$alert,
+                            High   = CVM_PALETTE$alert,
                             CVM_PALETTE$muted)
-  # Hero pull-quote rendered flush inside the Trajectory card's right
-  # column. Left accent rule preserves the status color (success / warn
-  # / alert) without reintroducing a nested-card shadow.
+  range_text <- if (is.finite(consistency$range_min %||% NA_real_) &&
+                    is.finite(consistency$range_max %||% NA_real_)) {
+    sprintf("%% ≥ 80 range: %.1f%% – %.1f%% across last %d cohorts",
+            consistency$range_min, consistency$range_max,
+            consistency$n_used)
+  } else NULL
+
   consistency_ui <- tags$div(
     style = sprintf(
-      "border-left:4px solid %s;padding:8px 0 8px 20px;min-height:200px;display:flex;flex-direction:column;justify-content:center;",
+      "border-left:4px solid %s;padding:8px 0 8px 20px;display:flex;flex-direction:column;justify-content:flex-start;",
       consistency_bar
     ),
     tags$div(
-      style = "font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;margin-bottom:12px;",
-      "Delivery consistency"
+      style = "font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;margin-bottom:4px;",
+      "Delivery Consistency (last 3 cohorts)"
+    ),
+    tags$div(
+      style = "font-size:11px;color:#5A6472;margin-bottom:12px;font-style:italic;",
+      "Based on % students achieving ≥ 80%"
     ),
     tags$div(
       style = sprintf("font-size:56px;font-weight:700;color:%s;line-height:1;letter-spacing:-0.02em;", consistency_bar),
@@ -989,11 +1149,29 @@ if (length(all_data) < 2) {
     ),
     tags$div(
       style = "font-size:13px;color:#1A1A2E;margin-top:10px;font-variant-numeric:tabular-nums;",
-      sprintf("CV = %s across %d cohorts", cv_display, length(all_data))
+      sprintf("CV = %s", cv_display)
     ),
-    tags$p(
-      style = "margin:16px 0 0 0;font-size:12px;color:#5A6472;line-height:1.5;",
-      "Low CV = stable course delivery year over year. High CV flags year-to-year inconsistency that warrants investigation."
+    if (!is.null(range_text)) {
+      tags$div(
+        style = "font-size:13px;color:#1A1A2E;margin-top:6px;font-variant-numeric:tabular-nums;",
+        range_text
+      )
+    },
+    tags$div(
+      style = "margin-top:18px;padding:14px 16px;background:#F5F7FA;border-radius:8px;",
+      tags$div(
+        style = "font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:#5A6472;margin-bottom:8px;",
+        "How to read this"
+      ),
+      tags$ul(
+        style = "margin:0;padding-left:18px;font-size:12px;color:#5A6472;line-height:1.6;",
+        tags$li(HTML("<strong>CV (Coefficient of Variation)</strong> = SD ÷ Mean × 100")),
+        tags$li("Measures how consistently the course delivers outcomes year over year"),
+        tags$li(HTML("<strong>Low CV (&lt; 5%)</strong> = stable delivery — outcomes are consistent across cohorts")),
+        tags$li(HTML("<strong>Medium CV (5–15%)</strong> = some variation — worth monitoring")),
+        tags$li(HTML("<strong>High CV (&gt; 15%)</strong> = significant year-to-year inconsistency — investigate curriculum or delivery changes")),
+        tags$li(HTML("The <strong>% ≥ 80 range</strong> shows the actual spread: e.g. 93.9%–99.5% means in the best year 99.5% of students passed at 80%+, in the worst year 93.9% did"))
+      )
     )
   )
 
@@ -1007,7 +1185,7 @@ if (length(all_data) < 2) {
     textposition = "outside",
     textfont = list(color = "#1A1A2E", size = 12, family = "Inter"),
     hovertemplate = "%{x}<br>%{y} students<extra></extra>",
-    height = 320
+    height = 460
   ) |>
     plotly::layout(
       title = list(text = "Students assessed per cohort",
@@ -1021,8 +1199,10 @@ if (length(all_data) < 2) {
       font = list(color = CVM_PALETTE$text, family = "Inter, sans-serif"),
       margin = list(t = 50, b = 80, l = 60, r = 40),
       showlegend = FALSE, autosize = TRUE
-    ) |>
-    plotly::config(displaylogo = FALSE, responsive = TRUE)
+    )
+  volume_bar <- do.call(plotly::config,
+                        c(list(volume_bar),
+                          cvm_plotly_config_args(filename_tag = "student_volume")))
 
   # ---------- 4 + 5. Top consistent / variable tags ----------
   # Inner mini-cards — soft background + accent rule; sit inside the
@@ -1100,8 +1280,10 @@ if (length(all_data) < 2) {
           Flag        = .data$Flag
         ),
       rownames = FALSE, escape = FALSE,
+      extensions = "Buttons",
       options  = list(
-        dom = "tp", pageLength = 15, scrollX = FALSE,
+        dom = "Bfrtip", pageLength = 15, scrollX = FALSE,
+        buttons = cvm_dt_buttons("assessment_trends"),
         columnDefs = list(
           list(targets = 0, className = "dt-left"),
           list(targets = 1:5, className = "dt-right")
@@ -1143,7 +1325,7 @@ if (length(all_data) < 2) {
       class = "cvm-card", style = cy_card_style,
       tags$h2(class = "cvm-card-title", "Grade trajectory — cohort over cohort"),
       tags$p(class = "cvm-card-desc",
-             "Each cohort's median compared to the prior cohort's median, with a delivery-consistency verdict derived from the CV."),
+             "Share of students at ≥ 80% per cohort, with delta vs the prior cohort; consistency verdict uses the last 3 cohorts."),
       tags$div(
         style = "display:grid;grid-template-columns:2fr 1fr;gap:24px;align-items:start;",
         tags$div(trajectory_ui),
@@ -1175,6 +1357,374 @@ if (length(all_data) < 2) {
       assess_ui
     )
   )
+}
+```
+
+# Survey Trends
+
+```{r}
+#| title: "Survey Trends"
+# Multi-year survey trend tab.
+#
+# Data contract: one CSV per course at data/survey_responses/{SAFE_CODE}.csv
+# with columns cohort, question_text, mean_score, n_respondents.
+# (See data/survey_responses/README.md for the full schema.)
+#
+# Behavior:
+#   * If a CSV exists matching the course code, render a plotly line
+#     chart — one line per question, x = cohort year, y = mean score.
+#   * Else, if any survey PDFs exist for any cohort, show a "data
+#     available — extract responses" nudge.
+#   * Else, show the instructional message only.
+
+st_card_style <- paste0(
+  "width:100%;display:block;clear:both;",
+  "margin-bottom:48px;padding:24px;",
+  "background:#FFFFFF;border:1px solid #EEF1F5;border-radius:12px;",
+  "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+)
+
+safe_code_for_csv <- gsub("[^A-Za-z0-9]", "", primary$course_code)
+survey_csv_path <- file.path(proj_root, "data", "survey_responses",
+                             paste0(safe_code_for_csv, ".csv"))
+
+# Detect whether ANY surveys folder has at least one PDF.
+any_survey_pdfs <- any(vapply(names(all_data), function(lab) {
+  r <- all_data[[lab]]
+  s_dir <- surveys_dir(r$course_code, r$course_name, r$cohort_label)
+  if (!dir.exists(s_dir)) return(FALSE)
+  length(list.files(s_dir, pattern = "\\.pdf$")) > 0
+}, logical(1)))
+
+instructional_block <- tags$div(
+  style = "padding:18px 22px;background:#EEF4FB;border-left:4px solid #003F6B;border-radius:8px;color:#003F6B;font-size:14px;line-height:1.6;",
+  if (any_survey_pdfs) {
+    HTML(paste0(
+      "<strong>Survey data available</strong> — extract question responses ",
+      "to enable trend graphs. ",
+      "Drop a CSV at <code>data/survey_responses/",
+      htmlEscape(safe_code_for_csv), ".csv</code> with columns ",
+      "<code>cohort, question_text, mean_score, n_respondents</code>. ",
+      "See <code>data/survey_responses/README.md</code> for full instructions."
+    ))
+  } else {
+    HTML(paste0(
+      "<strong>Survey trend chart not yet populated.</strong> ",
+      "Drop a CSV at <code>data/survey_responses/",
+      htmlEscape(safe_code_for_csv), ".csv</code> with columns ",
+      "<code>cohort, question_text, mean_score, n_respondents</code> ",
+      "to render a multi-cohort trend chart on this tab. ",
+      "See <code>data/survey_responses/README.md</code> for full instructions."
+    ))
+  }
+)
+
+# If a structured CSV exists for this course, render the trend line chart.
+# Otherwise, fall back to PDF text mining: pdftools-extracted previews +
+# keyword-frequency heatmap across the survey PDFs Ish has dropped in.
+csv_branch <- function() {
+  survey_df <- tryCatch(
+    readr::read_csv(survey_csv_path, show_col_types = FALSE),
+    error = function(e) {
+      message(sprintf("survey CSV read failed: %s", conditionMessage(e)))
+      NULL
+    }
+  )
+  required_cols <- c("cohort", "question_text", "mean_score", "n_respondents")
+  if (is.null(survey_df) || !all(required_cols %in% names(survey_df))) {
+    return(tags$div(
+      class = "cvm-card", style = st_card_style,
+      tags$h2(class = "cvm-card-title", "Survey Trends"),
+      tags$p(class = "cvm-card-desc",
+             "Multi-year mean response per survey question."),
+      ui_banner(sprintf(
+        "Survey CSV at %s is malformed. Required columns: %s.",
+        survey_csv_path, paste(required_cols, collapse = ", ")
+      ), variant = "warn")
+    ))
+  }
+  survey_df$cohort_year <- suppressWarnings(
+    as.integer(sub("^Class of ", "", survey_df$cohort))
+  )
+  survey_df <- survey_df[!is.na(survey_df$cohort_year) &
+                         is.finite(survey_df$mean_score), , drop = FALSE]
+  if (nrow(survey_df) == 0) {
+    return(tags$div(
+      class = "cvm-card", style = st_card_style,
+      tags$h2(class = "cvm-card-title", "Survey Trends"),
+      ui_banner("Survey CSV exists but no parseable rows found.",
+                variant = "warn")
+    ))
+  }
+  st_plot <- plotly::plot_ly(
+    data = survey_df,
+    x = ~cohort_year, y = ~mean_score,
+    color = ~question_text,
+    type = "scatter", mode = "lines+markers",
+    text = ~paste0("Question: ", question_text,
+                   "<br>Cohort: ", cohort,
+                   "<br>Mean: ", round(mean_score, 2),
+                   "<br>N: ", n_respondents),
+    hoverinfo = "text",
+    height = 460
+  ) |>
+    plotly::layout(
+      title = list(text = sprintf("Survey question trends — %s",
+                                  primary$course_code),
+                   font = list(color = CVM_PALETTE$navy, size = 14)),
+      xaxis = list(title = "Cohort year", gridcolor = "#E4E7EC",
+                   type = "category", automargin = TRUE),
+      yaxis = list(title = "Mean score", gridcolor = "#E4E7EC"),
+      legend = list(orientation = "h", y = -0.3),
+      paper_bgcolor = "white", plot_bgcolor = "white",
+      font = list(color = CVM_PALETTE$text, family = "Inter, sans-serif"),
+      margin = list(t = 50, b = 140, l = 60, r = 40),
+      autosize = TRUE
+    )
+  st_plot <- do.call(plotly::config,
+                     c(list(st_plot),
+                       cvm_plotly_config_args(filename_tag = "survey_trends")))
+  tags$div(
+    class = "cvm-card", style = st_card_style,
+    tags$h2(class = "cvm-card-title", "Survey Trends"),
+    tags$p(class = "cvm-card-desc",
+           "Mean response per question across cohorts. Hover any line for question text and N."),
+    ui_plot_box(st_plot, height = 480)
+  )
+}
+
+pdf_branch <- function() {
+  records <- analyse_survey_trends(all_data, cohort_colors)
+  if (length(records) == 0) {
+    return(tags$div(
+      class = "cvm-card", style = st_card_style,
+      tags$h2(class = "cvm-card-title", "Survey Trends"),
+      tags$p(class = "cvm-card-desc",
+             "Multi-year mean response per survey question, once data is available."),
+      instructional_block
+    ))
+  }
+
+  cohort_order <- vapply(records, function(rec) rec$cohort, character(1))
+
+  # Keyword agreement summary feeds the headline insight card only.
+  # The aggregate trend pivot table was removed in favor of stacked
+  # per-cohort response cards that are easier to scan side-by-side.
+  trend_df <- build_survey_trend_summary(records)
+  cohort_cols <- intersect(cohort_order, names(trend_df) %||% character())
+
+  # ── Summary insight card ──────────────────────────────────────────
+  summary_card <- {
+    if (is.null(trend_df) || nrow(trend_df) == 0 || length(cohort_cols) == 0) NULL
+    else {
+      latest_col <- cohort_cols[[length(cohort_cols)]]
+      latest_vals <- suppressWarnings(as.numeric(trend_df[[latest_col]]))
+      strong   <- trend_df$keyword[!is.na(latest_vals) & latest_vals >= 75]
+      weak     <- trend_df$keyword[!is.na(latest_vals) & latest_vals < 50]
+      improving <- trend_df$keyword[trend_df$trend == "improving"]
+      declining <- trend_df$keyword[trend_df$trend == "declining"]
+
+      bullet_line <- function(color, label, items) {
+        if (length(items) == 0) return(NULL)
+        tags$li(
+          style = "margin-bottom:8px;color:#1A1A2E;",
+          tags$strong(style = sprintf("color:%s;", color), paste0(label, ": ")),
+          paste(items, collapse = "; ")
+        )
+      }
+      bullets <- tags$ul(
+        style = "margin:0;padding-left:20px;font-size:14px;line-height:1.7;",
+        bullet_line("#2E7D32", "Strong agreement (≥ 75)", strong),
+        bullet_line("#C62828", "Low agreement (< 50)",     weak),
+        bullet_line("#2E7D32", "Improving across cohorts", improving),
+        bullet_line("#F57C00", "Declining across cohorts", declining)
+      )
+      tags$div(
+        class = "cvm-card", style = st_card_style,
+        tags$h2(class = "cvm-card-title", "What the surveys are telling us"),
+        tags$p(class = "cvm-card-desc",
+               sprintf("Across %d cohort%s (latest: %s).",
+                       length(cohort_cols),
+                       if (length(cohort_cols) == 1) "" else "s",
+                       latest_col)),
+        bullets
+      )
+    }
+  }
+
+  # ── Per-cohort STRUCTURED response tables ────────────────────────
+  # Inline parser: walk the raw PDF text line-by-line and pick out rows
+  # of the form
+  #
+  #   <component label>   SA  A  N  D  SD  [N/A]  Total
+  #
+  # validating that Total ≈ sum of the categorical counts. Returns a
+  # data.frame with Agree / Neutral / Disagree percentages, the base N,
+  # and a colored Rating chip. Returns NULL when no rows can be
+  # confidently extracted, so the per-cohort card can swap to a clean
+  # one-line fallback message instead of dumping raw text.
+  parse_likert_rows <- function(text) {
+    if (is.null(text) || !is.character(text) || !nzchar(text)) return(NULL)
+    lines <- unlist(strsplit(text, "\n", fixed = TRUE))
+    # cvm.gradebook survey export PDF row format (verified against the
+    # 6 cohort PDFs):
+    #
+    #   "N. <label>   SA  A  N  D  SD  [NA-col]   <NA>/<Total>   Avg"
+    #
+    # The integer between SD and the "/" can be a true N/A column OR can
+    # already be the X in "X / Y" — the PDF column widths shift between
+    # rows. Rather than hardcode column positions we:
+    #   1. scan each line for the "X / Y" score pattern; Y is the total
+    #   2. strip the score and the trailing decimal (Average) tokens
+    #   3. tokenize the remaining ints; the first 5 are SA, A, N, D, SD
+    #      (we ignore any extra ints in between — they're either the N/A
+    #      column duplicate or the X-in-score, neither of which we need)
+    #   4. base = SA+A+N+D+SD; N column = max(base, total_from_score)
+    out <- list()
+    for (line in lines) {
+      line <- trimws(line)
+      if (!nzchar(line)) next
+      # Skip percentage rows ("69.86% 30.14% ..."), header continuations
+      # ("Strongly agree"), and any line we recognize as non-data.
+      if (grepl("%", line, fixed = TRUE)) next
+      if (grepl("^(Strongly|Somewhat|Neither|Aggregate|Score|Average|Total|Form:|Report|Completed|Question|Section|Course)\\b",
+                line, ignore.case = TRUE)) next
+
+      # Score column "X / Y" → total_from_score = Y.
+      score_m <- regmatches(line, regexec("(\\d+)\\s*/\\s*(\\d+)",
+                                          line, perl = TRUE))[[1]]
+      total_from_score <- if (length(score_m) >= 3) as.integer(score_m[[3]]) else NA_integer_
+      stripped <- if (length(score_m) > 0) {
+        sub("\\d+\\s*/\\s*\\d+", " ", line, perl = TRUE)
+      } else line
+      # Drop trailing decimal (Average column).
+      stripped <- sub("\\s+\\d+\\.\\d+\\s*$", "", stripped, perl = TRUE)
+      # Drop a leading "N." item numbering.
+      stripped <- sub("^(\\d+)\\.\\s+", "", stripped, perl = TRUE)
+
+      ints <- regmatches(stripped,
+                         gregexpr("\\b\\d+\\b", stripped, perl = TRUE))[[1]]
+      if (length(ints) < 5) next
+      ints_n <- as.integer(ints)
+      sa <- ints_n[[1]]; a  <- ints_n[[2]]; n <- ints_n[[3]]
+      d  <- ints_n[[4]]; sd <- ints_n[[5]]
+      answered <- sa + a + n + d + sd
+      if (answered <= 0) next
+      total <- if (!is.na(total_from_score) && total_from_score >= answered) {
+        total_from_score
+      } else answered
+
+      label <- trimws(sub("\\s+\\d.*$", "", stripped, perl = TRUE))
+      if (nchar(label) < 3 || nchar(label) > 120) next
+      # Skip rows whose "label" is actually a histogram bin caption
+      # (e.g. "[0-5] (5-15] (15-25] ... Missing") — those crop up when a
+      # cohort's surveys/ folder also contains a feedback-report PDF
+      # rather than an end-of-course Likert PDF. Heuristic: a real
+      # course-component label has at least 8 alphabetic characters and
+      # no square-bracket/parenthesis-numeric tokens.
+      letters_only <- gsub("[^A-Za-z]", "", label)
+      if (nchar(letters_only) < 8) next
+      if (grepl("[\\[\\(]\\s*\\d", label, perl = TRUE)) next
+
+      out[[length(out) + 1]] <- data.frame(
+        Component       = label,
+        `Agree (%)`     = round(100 * (sa + a) / answered, 1),
+        `Neutral (%)`   = round(100 *  n        / answered, 1),
+        `Disagree (%)`  = round(100 * (sd + d) / answered, 1),
+        N               = total,
+        check.names = FALSE, stringsAsFactors = FALSE
+      )
+    }
+    if (length(out) == 0) return(NULL)
+    do.call(rbind, out)
+  }
+
+  # Each cohort gets its OWN white card with cohort-colored header — no
+  # rating chips, no aggregate trend table. Just the four-column response
+  # breakdown so faculty can scan the numbers directly. The wrapper
+  # `cvm-survey-cohort-card` enforces clear:both + display:block + 32 px
+  # bottom margin so cards never overlap.
+  per_cohort_cards <- lapply(records, function(rec) {
+    src <- rec$raw_text %||% rec$text %||% ""
+    parsed <- parse_likert_rows(src)
+
+    body <- if (is.null(parsed)) {
+      tags$p(
+        style = "margin:0;font-size:13px;color:#5A6472;",
+        sprintf("Survey PDF available — provide structured data at data/survey_responses/%s.csv for detailed analysis.",
+                safe_code_for_csv)
+      )
+    } else {
+      DT::datatable(
+        parsed, rownames = FALSE, escape = FALSE,
+        extensions = "Buttons",
+        options = list(
+          dom = "Bfrtip", pageLength = 25, scrollX = FALSE, ordering = TRUE,
+          buttons = cvm_dt_buttons(sprintf("survey_%s",
+                                           gsub("[^A-Za-z0-9]", "_",
+                                                rec$cohort))),
+          columnDefs = list(
+            list(targets = 0, className = "dt-left", width = "300px"),
+            list(targets = 1:3, className = "dt-right"),
+            list(targets = 4,   className = "dt-right", width = "60px")
+          ),
+          initComplete = DT::JS(
+            "function(settings, json) {",
+            "  $(this.api().table().header()).find('th').css({",
+            "    'background-color': '#003F6B',",
+            "    'color':            '#FFFFFF',",
+            "    'font-weight':      '600'",
+            "  });",
+            "}"
+          )
+        )
+      )
+    }
+
+    tags$div(
+      class = "cvm-card cvm-survey-cohort-card",
+      style = sprintf(
+        paste0("background:#FFFFFF;border:1px solid #EEF1F5;border-left:6px solid %s;",
+               "border-radius:12px;padding:24px;",
+               "margin-bottom:32px !important;display:block !important;clear:both !important;",
+               "box-shadow:0 2px 8px rgba(0,0,0,0.07);"),
+        rec$color
+      ),
+      tags$h2(
+        class = "cvm-card-title",
+        style = sprintf("color:%s;margin-top:0;", rec$color),
+        rec$cohort
+      ),
+      tags$p(
+        class = "cvm-card-desc",
+        style = "font-variant-numeric:tabular-nums;",
+        sprintf("Source: %s", htmlEscape(rec$pdf))
+      ),
+      body
+    )
+  })
+
+  # ── Data-quality note ────────────────────────────────────────────
+  note_card <- tags$div(
+    class = "cvm-card", style = st_card_style,
+    tags$div(
+      style = "padding:14px 18px;background:#FFF8E1;border-left:4px solid #AB8B00;border-radius:8px;color:#5A4A00;font-size:13px;line-height:1.6;",
+      HTML(sprintf(
+        paste0("<strong>Note:</strong> these scores are estimated from PDF text extraction ",
+               "and are intended for trend signals only. For precise analysis, ",
+               "provide structured CSV data at <code>data/survey_responses/%s.csv</code>."),
+        htmlEscape(safe_code_for_csv)
+      ))
+    )
+  )
+
+  do.call(tagList, c(list(summary_card), per_cohort_cards, list(note_card)))
+}
+
+if (file.exists(survey_csv_path)) {
+  csv_branch()
+} else {
+  pdf_branch()
 }
 ```
 
@@ -1288,6 +1838,11 @@ if (is.null(narrative)) {
     "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
   )
   tagList(
+    tags$button(
+      onclick = "window.print()",
+      style = "margin-bottom:16px;padding:8px 16px;background:#FFFFFF;border:1px solid #003F6B;color:#003F6B;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;",
+      "🖨 Print / Save as PDF"
+    ),
     tags$div(
       class = "cvm-card cvm-narrative",
       style = ci_card_style,
@@ -1351,6 +1906,58 @@ dl_card_style <- paste0(
   "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
 )
 
+# ---- General Downloads (drop-anywhere sink) ---------------------------
+# Anything Ish drops into outputs/{course}/downloads/ surfaces here.
+# Auto-detected on render; no schema, no naming convention.
+dl_dir_abs       <- downloads_dir(primary$course_code, primary$course_name)
+dl_drop_path_rel <- sub("^.*/outputs/", "outputs/", dl_dir_abs)
+
+icon_for_ext <- function(ext) {
+  switch(tolower(ext),
+         "pdf"  = "📄",
+         "pptx" = "📊", "ppt" = "📊",
+         "xlsx" = "📈", "xls" = "📈", "csv" = "📈",
+         "zip"  = "🗜️",
+         "doc"  = "📝", "docx" = "📝",
+         "png"  = "🖼️", "jpg" = "🖼️", "jpeg" = "🖼️",
+         "📁")
+}
+
+downloads_files <- if (dir.exists(dl_dir_abs)) {
+  fs <- list.files(dl_dir_abs, full.names = TRUE, recursive = FALSE,
+                   include.dirs = FALSE)
+  # Skip dotfiles like .DS_Store.
+  fs[!grepl("^\\.", basename(fs))]
+} else character(0)
+
+downloads_card <- tags$div(
+  class = "cvm-card",
+  style = dl_card_style,
+  tags$h2(class = "cvm-card-title", "Downloads"),
+  tags$p(class = "cvm-card-desc",
+         "Files dropped into this course's downloads folder are listed here automatically — any file type."),
+  if (length(downloads_files) == 0) {
+    tags$p(
+      style = "margin:0;font-size:13px;color:#5A6472;",
+      "No files available."
+    )
+  } else {
+    tags$div(
+      style = "display:grid;gap:10px;",
+      lapply(downloads_files, function(p) {
+        ext <- tools::file_ext(p)
+        ui_download_row(
+          label      = if (nzchar(ext)) toupper(ext) else "File",
+          href       = file.path("downloads", basename(p)),
+          filename   = basename(p),
+          size_bytes = file.info(p)$size,
+          icon       = icon_for_ext(ext)
+        )
+      })
+    )
+  }
+)
+
 exports_card <- tags$div(
   class = "cvm-card",
   style = dl_card_style,
@@ -1374,80 +1981,75 @@ exports_card <- tags$div(
   } else {
     tags$p(
       style = "margin:0;font-size:13px;color:#5A6472;",
-      HTML("No PowerPoint or Excel workbook yet. Re-run with <code>--with-exports</code> to generate them.")
+      "No exports generated yet."
     )
   }
 )
 
-# Per-cohort survey cards — one .cvm-filterable card per cohort so the
-# chip filter bar shows only the active cohorts.
+# Per-cohort survey cards — one .cvm-filterable card per cohort.
+# Placeholder-driven: when no PDF is present, show the exact drop path
+# Ish needs to copy a file into. When PDFs are present, render compact
+# download rows. No "ready_on / 2 days after end" microcopy anymore.
 survey_cards <- lapply(names(all_data), function(lab) {
   r <- all_data[[lab]]
   col <- cohort_color_for(lab)
-  s_dir_abs <- surveys_dir(r$course_code, r$cohort_label)
   safe_code <- gsub("[^A-Za-z0-9]", "", r$course_code)
   class_slug_local <- cohort_slug(r$cohort_label)
-  rel_base <- file.path("..", sprintf("%s_%s", safe_code, class_slug_local), "surveys")
-  drop_path_rel <- sub("^.*/outputs/", "outputs/", s_dir_abs)
+  survey_path <- file.path("surveys", class_slug_local)
 
-  # Card header — colored dot + cohort name in cohort color.
-  card_header <- tags$div(
-    style = sprintf("display:flex;align-items:center;gap:10px;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid #E0E4EC;"),
-    tags$span(style = sprintf(
-      "display:inline-block;width:14px;height:14px;border-radius:50%%;background:%s;", col
-    )),
-    tags$span(style = sprintf("font-size:16px;font-weight:700;color:%s;", col), lab)
-  )
-
-  body <- if (!dir.exists(s_dir_abs)) {
-    ready_on <- if (!is.null(r$max_period_finish_date) && !is.na(r$max_period_finish_date)) {
-      format(as.Date(r$max_period_finish_date) + 2)
-    } else "(period end date unknown)"
-    tags$p(
-      style = "margin:0;font-size:12px;color:#5A6472;",
-      sprintf("Survey folder will be created 2 days after course end (%s).",
-              ready_on)
-    )
-  } else {
-    pdfs <- list.files(s_dir_abs, pattern = "\\.pdf$", full.names = TRUE)
-    if (length(pdfs) == 0) {
-      tags$p(
-        style = "margin:0;font-size:12px;color:#5A6472;",
-        HTML(sprintf(
-          "Survey folder ready — drop PDF files at <code>%s</code>",
-          htmlEscape(drop_path_rel)
-        ))
-      )
-    } else {
-      # Fix 3: the "To add more, drop PDFs at …" microcopy was removed
-      # per spec. PDF rows only.
-      tags$div(
-        style = "display:grid;gap:8px;",
-        lapply(pdfs, function(p) {
-          ui_download_row(
-            label      = "Survey PDF",
-            href       = file.path(rel_base, basename(p)),
-            filename   = basename(p),
-            size_bytes = file.info(p)$size
-          )
-        })
-      )
-    }
-  }
-
-  # Fix 5: force survey cards visible by default. The .cvm-filterable
-  # class is only hidden by the filter JS when a chip is deselected — on
-  # initial load every card must render. `display:block !important`
-  # overrides any stray Quarto / bootstrap rule that would hide the card
-  # before JS boots.
   tags$div(
     class = "cvm-filterable",
     `data-cohort-labels` = lab,
     style = sprintf(
-      "display:block !important;background:#FFFFFF;border:1px solid #E0E4EC;border-left:4px solid %s;border-radius:12px;padding:20px 24px;box-shadow:0 2px 12px rgba(0,0,0,0.07);",
+      "display:block !important;background:#FFFFFF;border:1px solid #E0E4EC;border-left:4px solid %s;border-radius:12px;padding:20px 24px;",
       col
     ),
-    card_header, body
+    # Header — colored dot + cohort name in cohort color.
+    tags$div(
+      style = "display:flex;align-items:center;gap:10px;margin-bottom:16px;",
+      tags$span(style = sprintf(
+        "display:inline-block;width:14px;height:14px;border-radius:50%%;background:%s;", col
+      )),
+      tags$span(style = sprintf("font-size:16px;font-weight:700;color:%s;", col), lab)
+    ),
+    # Body — placeholder when no PDFs present; download rows otherwise.
+    {
+      s_dir <- surveys_dir(r$course_code, r$course_name, r$cohort_label)
+      # Show only the most recently modified PDF per cohort. Older copies
+      # stay in the folder for audit trail but the card surfaces the
+      # canonical "current" report.
+      pdfs <- if (dir.exists(s_dir)) {
+        all_pdfs <- list.files(s_dir, pattern = "\\.pdf$", full.names = TRUE)
+        if (length(all_pdfs) > 1) {
+          all_pdfs[which.max(file.mtime(all_pdfs))]
+        } else all_pdfs
+      } else character(0)
+      if (length(pdfs) == 0) {
+        tags$div(
+          style = "background:#F5F6FA;border-radius:8px;padding:14px 16px;",
+          tags$div(
+            style = "font-size:12px;color:#5A6472;margin-bottom:6px;",
+            "No survey file yet. Drop PDF here:"
+          ),
+          tags$code(
+            style = "font-size:11px;color:#003F6B;background:#EEF4FB;padding:4px 8px;border-radius:4px;display:block;",
+            sprintf("outputs/%s_Foundations/surveys/%s/", safe_code, class_slug_local)
+          )
+        )
+      } else {
+        tags$div(
+          style = "display:grid;gap:8px;",
+          lapply(pdfs, function(p) {
+            ui_download_row(
+              label      = "Survey PDF",
+              href       = file.path(survey_path, basename(p)),
+              filename   = basename(p),
+              size_bytes = file.info(p)$size
+            )
+          })
+        )
+      }
+    }
   )
 })
 
@@ -1462,18 +2064,137 @@ surveys_card <- tags$div(
   tags$p(class = "cvm-card-desc",
          "End-of-course survey PDFs available for each graduating class."),
   tags$div(
+    class = "cvm-survey-grid",
     style = "display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:20px;",
     survey_cards
   )
 )
 
-tagList(exports_card, surveys_card)
+# ---- Student Feedback section ----------------------------------------
+# Per-cohort cards listing mid-course and delta feedback PDFs. The two
+# folders are auto-created at render time. Drop-here message shown when
+# the folder exists but is empty (parity with surveys).
+feedback_cards <- lapply(names(all_data), function(lab) {
+  r <- all_data[[lab]]
+  col <- cohort_color_for(lab)
+  safe_code <- gsub("[^A-Za-z0-9]", "", r$course_code)
+  class_slug_local <- cohort_slug(r$cohort_label)
+
+  card_header <- tags$div(
+    style = "display:flex;align-items:center;gap:10px;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid #E0E4EC;",
+    tags$span(style = sprintf(
+      "display:inline-block;width:14px;height:14px;border-radius:50%%;background:%s;", col
+    )),
+    tags$span(style = sprintf("font-size:16px;font-weight:700;color:%s;", col), lab)
+  )
+
+  build_kind_block <- function(kind, kind_label) {
+    fb_dir_abs <- feedback_dir(r$course_code, r$course_name, r$cohort_label, kind)
+    # New layout: feedback PDFs live in the same course folder.
+    rel_base <- file.path("feedback", class_slug_local, kind)
+    drop_path_rel <- sub("^.*/outputs/", "outputs/", fb_dir_abs)
+
+    body <- if (!dir.exists(fb_dir_abs)) {
+      tags$p(
+        style = "margin:0;font-size:12px;color:#5A6472;",
+        "Folder will be created on next render."
+      )
+    } else {
+      pdfs <- list.files(fb_dir_abs, pattern = "\\.pdf$", full.names = TRUE)
+      if (length(pdfs) == 0) {
+        tags$p(
+          style = "margin:0;font-size:12px;color:#5A6472;",
+          HTML(sprintf("Folder ready — drop %s PDFs at <code>%s</code>",
+                       kind_label, htmlEscape(drop_path_rel)))
+        )
+      } else {
+        tags$div(
+          style = "display:grid;gap:8px;",
+          lapply(pdfs, function(p) {
+            ui_download_row(
+              label      = kind_label,
+              href       = file.path(rel_base, basename(p)),
+              filename   = basename(p),
+              size_bytes = file.info(p)$size
+            )
+          })
+        )
+      }
+    }
+    tags$div(
+      style = "margin-bottom:14px;",
+      tags$div(
+        style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;font-weight:600;margin-bottom:6px;",
+        kind_label
+      ),
+      body
+    )
+  }
+
+  tags$div(
+    class = "cvm-filterable",
+    `data-cohort-labels` = lab,
+    style = sprintf(
+      "display:block !important;background:#FFFFFF;border:1px solid #E0E4EC;border-left:4px solid %s;border-radius:12px;padding:20px 24px;box-shadow:0 2px 12px rgba(0,0,0,0.07);",
+      col
+    ),
+    card_header,
+    build_kind_block("midcourse", "Mid-course feedback PDF"),
+    build_kind_block("delta",     "Delta feedback PDF")
+  )
+})
+
+feedback_card <- tags$div(
+  class = "cvm-card",
+  style = dl_card_style,
+  tags$h2(class = "cvm-card-title", "Student Feedback"),
+  tags$p(class = "cvm-card-desc",
+         "Mid-course and delta (end-of-course) student feedback PDFs by cohort. Drop PDFs into the folders shown below; they appear here automatically on the next render."),
+  tags$div(
+    class = "cvm-survey-grid",
+    style = "display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:20px;",
+    feedback_cards
+  )
+)
+
+tagList(downloads_card, exports_card, surveys_card, feedback_card)
 ```
 
 ```{r}
 #| include: false
 #| output: false
 # Filter-bar JSON payload — next chunk writes the raw HTML block.
+```
+
+```{r}
+#| include: false
+# Feedback widget configuration — Google Form submission.
+# Submitting to a Google Form requires no API key and no special sheet
+# permissions: the widget POSTs to the form's formResponse endpoint with
+# the entry.<id> field names that Google assigns to each question. Pull
+# the entry IDs from a "Get pre-filled link" preview of the form.
+#
+# Env vars (set in ~/.Renviron):
+#   CVM_FEEDBACK_FORM_ID            – the long ID between /forms/d/e/ and /viewform
+#   CVM_FEEDBACK_ENTRY_TAB          – entry.NNNNNNNNNN for the tab dropdown
+#   CVM_FEEDBACK_ENTRY_COURSE       – entry.NNNNNNNNNN for course code
+#   CVM_FEEDBACK_ENTRY_FEEDBACK     – entry.NNNNNNNNNN for the free-text field
+#   CVM_FEEDBACK_ENTRY_TIMESTAMP    – entry.NNNNNNNNNN for the timestamp field
+feedback_form_id      <- Sys.getenv("CVM_FEEDBACK_FORM_ID",        unset = "")
+feedback_entry_tab    <- Sys.getenv("CVM_FEEDBACK_ENTRY_TAB",      unset = "")
+feedback_entry_course <- Sys.getenv("CVM_FEEDBACK_ENTRY_COURSE",   unset = "")
+feedback_entry_fb     <- Sys.getenv("CVM_FEEDBACK_ENTRY_FEEDBACK", unset = "")
+feedback_entry_ts     <- Sys.getenv("CVM_FEEDBACK_ENTRY_TIMESTAMP", unset = "")
+feedback_enabled <- nzchar(feedback_form_id) && nzchar(feedback_entry_tab)
+feedback_config_json <- jsonlite::toJSON(list(
+  form_id         = feedback_form_id,
+  entry_tab       = feedback_entry_tab,
+  entry_course    = feedback_entry_course,
+  entry_feedback  = feedback_entry_fb,
+  entry_timestamp = feedback_entry_ts,
+  course_code     = primary$course_code,
+  enabled         = feedback_enabled
+), auto_unbox = TRUE)
 ```
 
 ```{=html}
@@ -1486,36 +2207,50 @@ tagList(exports_card, surveys_card)
 <script id="cvm-course-code" type="application/json">
 "`r primary$course_code`"
 </script>
+<script id="cvm-feedback-config" type="application/json">
+`r feedback_config_json`
+</script>
+<script id="cvm-tag-data" type="application/json">
+`r tag_data_json`
+</script>
 <style>
-  /* Sticky filter bar — scoped via .cvm-* classes so nothing collides with
-     Quarto's Bootstrap layout. */
+  /* Sticky filter bar — chunkier, more obviously interactive. The label
+     is now stacked above the chip row, the chips are larger, and active
+     chips fill solid navy with a 4px cohort-colored left edge so they
+     clearly stand out from the inactive (light gray) chips. A 2px navy
+     separator line sits below the bar to mark the visual break before
+     the first content card. */
   .cvm-filter-bar {
     position: sticky;
     top: 0;
     z-index: 100;
     background: #FFFFFF;
     box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-    padding: 12px 24px;
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-    border-bottom: 1px solid #E0E4EC;
+    padding: 14px 24px 18px 24px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+    border-bottom: 2px solid #003F6B;
     font-family: Inter, "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
   }
   .cvm-filter-bar .label {
-    font-size: 11px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.08em;
-    color: #5A6472;
+    font-size: 12px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.12em;
+    color: #003F6B;
   }
-  .cvm-filter-bar .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .cvm-filter-bar .chips {
+    display: flex; flex-wrap: wrap; gap: 10px;
+    align-items: center;
+  }
   .cvm-chip {
     display: inline-flex; align-items: center; gap: 8px;
-    padding: 6px 14px;
-    border: 2px solid transparent;
-    border-radius: 20px;
-    background: #E8ECF0;
-    color: #9AA5B1;
-    font-size: 12px; font-weight: 500;
+    padding: 8px 18px;
+    border: 2px solid #C7CDD6;
+    border-left: 4px solid #C7CDD6;
+    border-radius: 22px;
+    background: #F5F7FA;
+    color: #5A6472;
+    font-size: 13px; font-weight: 600;
     cursor: pointer; user-select: none;
-    transition: background 120ms, color 120ms, border-color 120ms;
+    transition: background 140ms, color 140ms, border-color 140ms;
   }
   .cvm-chip .chip-dot {
     display: inline-block;
@@ -1525,19 +2260,31 @@ tagList(exports_card, surveys_card)
     background: transparent;
     border: 2px solid #9AA5B1;
   }
-  .cvm-chip:hover { background: #F0F4F8; }
+  .cvm-chip:hover {
+    background: #E8ECF0;
+    border-color: #9AA5B1;
+    color: #1A1A2E;
+  }
   .cvm-chip.active {
-    background: #FFFFFF;
-    color: var(--chip-color, #003F6B);
-    border-color: var(--chip-color, #003F6B);
+    background: #003F6B;
+    color: #FFFFFF;
+    border-color: #003F6B;
+    border-left-color: var(--chip-color, #AB8B00);
+    box-shadow: 0 2px 6px rgba(0, 63, 107, 0.25);
   }
   .cvm-chip.active .chip-dot {
-    background: var(--chip-color, #003F6B);
-    border-color: var(--chip-color, #003F6B);
+    background: var(--chip-color, #FFFFFF);
+    border-color: #FFFFFF;
   }
   .cvm-chip:focus-visible {
     outline: 2px solid #AB8B00;
     outline-offset: 2px;
+  }
+  .cvm-filter-actions {
+    display: flex; gap: 14px; margin-left: auto;
+  }
+  @media (max-width: 700px) {
+    .cvm-filter-actions { margin-left: 0; }
   }
   .cvm-filter-actions { margin-left: auto; display: flex; gap: 14px; }
   .cvm-filter-actions a {
@@ -1551,17 +2298,20 @@ tagList(exports_card, surveys_card)
   }
   .cvm-filterable { transition: opacity 150ms; }
 
-  /* --- Fix 1: histogram grid — fixed 3-column layout, every card exactly
-     360px tall, nothing absolutely-positioned so cards cannot overlap. */
+  /* --- Fix 1: histogram grid — 3-column responsive layout, cards size to
+     content so charts are never clipped. min-height gives a visual floor
+     without imposing an overflow:hidden ceiling. */
   .cvm-histogram-grid {
     display: grid !important;
     grid-template-columns: repeat(3, 1fr) !important;
-    grid-auto-rows: 360px !important;
+    grid-auto-rows: auto !important;
     gap: 16px !important;
   }
   .cvm-histogram-grid > .cvm-histogram-card {
     position: relative !important;
-    height: 360px !important;
+    min-height: 500px !important;
+    height: auto !important;
+    overflow: visible !important;
     margin: 0 !important;
   }
 
@@ -1642,10 +2392,163 @@ tagList(exports_card, surveys_card)
   .tab-pane#assessment-performance,
   .tab-pane#curriculum-tag-coverage,
   .tab-pane#cross-year-comparison,
+  .tab-pane#survey-trends,
   .tab-pane#course-insights,
   .tab-pane#downloads {
     overflow-y: auto !important;
     height: auto !important;
+  }
+
+  /* --- Feedback widget (fixed bottom-right, every tab) --------------- */
+  .cvm-feedback-button {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999;
+    background: #003F6B;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 999px;
+    padding: 12px 20px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+    font-family: Inter, "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  .cvm-feedback-button:hover { background: #002D4D; }
+  .cvm-feedback-button:focus-visible {
+    outline: 2px solid #AB8B00; outline-offset: 2px;
+  }
+  .cvm-feedback-panel {
+    position: fixed;
+    bottom: 80px;
+    right: 24px;
+    z-index: 9999;
+    width: 340px;
+    max-width: calc(100vw - 48px);
+    background: #FFFFFF;
+    border: 1px solid #E0E4EC;
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    padding: 18px 20px;
+    font-family: Inter, "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+    display: none;
+  }
+  .cvm-feedback-panel.open { display: block; }
+  .cvm-feedback-panel h3 {
+    margin: 0 0 12px 0;
+    font-size: 15px;
+    font-weight: 700;
+    color: #003F6B;
+  }
+  .cvm-feedback-panel label {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #5A6472;
+    font-weight: 600;
+    margin-bottom: 4px;
+    margin-top: 10px;
+  }
+  .cvm-feedback-panel select,
+  .cvm-feedback-panel textarea {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid #C7CDD6;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-family: inherit;
+    color: #1A1A2E;
+    background: #FFFFFF;
+  }
+  .cvm-feedback-panel textarea {
+    resize: vertical;
+    min-height: 80px;
+  }
+  .cvm-feedback-panel select:focus,
+  .cvm-feedback-panel textarea:focus {
+    outline: 2px solid #003F6B; outline-offset: 1px;
+    border-color: #003F6B;
+  }
+  .cvm-feedback-panel .cvm-fb-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 14px;
+    gap: 10px;
+  }
+  .cvm-feedback-panel .cvm-fb-submit {
+    background: #003F6B;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .cvm-feedback-panel .cvm-fb-submit:hover { background: #002D4D; }
+  .cvm-feedback-panel .cvm-fb-submit:disabled {
+    background: #9AA5B1; cursor: not-allowed;
+  }
+  .cvm-feedback-panel .cvm-fb-cancel {
+    background: transparent;
+    color: #5A6472;
+    border: none;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .cvm-feedback-status {
+    margin-top: 10px;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .cvm-feedback-status.ok    { color: #2E7D32; }
+  .cvm-feedback-status.err   { color: #C62828; }
+  .cvm-feedback-status.info  { color: #5A6472; }
+
+  /* DT Buttons (CSV / Excel) — compact icon-style row aligned right
+     above each table. Keeps download chrome out of the table body so the
+     data carries the visual weight (Brand Guardian / UI Designer). */
+  .cvm-card .dt-buttons {
+    float: right !important;
+    margin: 0 0 12px 0 !important;
+    display: flex !important;
+    gap: 6px !important;
+  }
+  .cvm-card .dt-buttons .dt-button {
+    background: #FFFFFF !important;
+    border: 1px solid #C7CDD6 !important;
+    color: #003F6B !important;
+    border-radius: 6px !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    padding: 4px 10px !important;
+    line-height: 1.4 !important;
+    box-shadow: none !important;
+  }
+  .cvm-card .dt-buttons .dt-button:hover {
+    background: #EEF4FB !important;
+    border-color: #003F6B !important;
+  }
+  /* Clear the float so the table sits properly below. */
+  .cvm-card .dataTables_wrapper::after {
+    content: ""; display: block; clear: both;
+  }
+
+  /* Print mode — hides chrome that doesn't make sense on paper and lets
+     the narrative card lay out as one continuous block per page. The
+     "Print / Save as PDF" button on Course Insights triggers this via
+     window.print(). */
+  @media print {
+    .cvm-filter-bar, .cvm-feedback-button, .cvm-feedback-panel,
+    .quarto-dashboard .navbar { display: none !important; }
+    .cvm-card { break-inside: avoid; }
+    .cvm-narrative { display: block !important; }
   }
 </style>
 <script>
@@ -1763,6 +2666,93 @@ tagList(exports_card, surveys_card)
       }
     });
     recomputeKpis();
+    applyToCharts();
+    applyToTables();
+
+    // Collapse empty grid space — when the filter narrows the visible
+    // card count, drop from a 3-column to 2- or 1-column layout so the
+    // remaining cards stretch to fill the row instead of leaving gaps.
+    document.querySelectorAll(".cvm-histogram-grid, .cvm-survey-grid").forEach(function(grid) {
+      var visible = grid.querySelectorAll('.cvm-filterable:not([style*="display: none"])').length;
+      if (visible === 1) {
+        grid.style.gridTemplateColumns = "1fr";
+      } else if (visible === 2) {
+        grid.style.gridTemplateColumns = "repeat(2, 1fr)";
+      } else {
+        grid.style.gridTemplateColumns = "repeat(3, 1fr)";
+      }
+    });
+  }
+
+  // applyToTables: for every DataTable on the page, walk its rows and
+  // hide any row whose visible text references a cohort label that's
+  // NOT in the active set. Rows with no cohort reference (headers,
+  // aggregates, summary lines) always stay visible.
+  function applyToTables() {
+    if (typeof window.jQuery === "undefined") return;
+    var $ = window.jQuery;
+    if (!$.fn || !$.fn.DataTable) return;
+    var cohortLabels = Object.keys(COHORT_COLORS || {});
+    if (cohortLabels.length === 0) return;
+    document.querySelectorAll(".dataTable").forEach(function(table) {
+      var dtInstance;
+      try { dtInstance = $(table).DataTable(); }
+      catch (e) { return; }
+      if (!dtInstance) return;
+      try {
+        dtInstance.rows().every(function() {
+          var node = this.node();
+          if (!node) return;
+          var rowText = node.textContent || node.innerText || "";
+          var rowCohort = cohortLabels.find(function(c) {
+            return rowText.indexOf(c) >= 0;
+          });
+          // No cohort label found anywhere in the row → header / summary.
+          if (!rowCohort) { $(node).show(); return; }
+          if (active.has(rowCohort)) $(node).show();
+          else                        $(node).hide();
+        });
+        dtInstance.draw(false);
+      } catch (e) {
+        console.warn("cvm filter: applyToTables row walk failed", e);
+      }
+    });
+  }
+
+  // applyToCharts: re-runs every chip toggle (and on initial load via the
+  // apply() call below). For every plotly chart on the page, walk its
+  // traces and flip visibility based on whether the trace's name matches
+  // an active cohort label. Non-cohort traces (e.g. the dashed gold "75%
+  // reference" line, or any trace whose name doesn't appear in our cohort
+  // color table) stay visible at all times. Cohort traces that belong to
+  // an INACTIVE cohort are demoted to plotly's "legendonly" state — they
+  // disappear from the chart but remain clickable in the legend, so a
+  // user can still pop them back without re-toggling the chip.
+  function applyToCharts() {
+    if (typeof Plotly === "undefined") return;
+    const cohortLabels = Object.keys(COHORT_COLORS || {});
+    document.querySelectorAll(".js-plotly-plot").forEach(function(plot) {
+      if (!plot.data || plot.data.length === 0) return;
+      const update = { visible: [] };
+      plot.data.forEach(function(trace) {
+        const traceName = trace.name || "";
+        // Is this trace tied to a known cohort?
+        const isCohortTrace = cohortLabels.some(function(c) {
+          return traceName === c || traceName.indexOf(c) >= 0;
+        });
+        if (!isCohortTrace) {
+          update.visible.push(true);
+          return;
+        }
+        const isActive = Array.from(active).some(function(cohort) {
+          return traceName === cohort || traceName.indexOf(cohort) >= 0;
+        });
+        update.visible.push(isActive ? true : "legendonly");
+      });
+      try { Plotly.restyle(plot, update); } catch (e) {
+        console.warn("cvm filter: Plotly.restyle failed", e);
+      }
+    });
   }
 
   // ---- build the bar ----------------------------------------------------
@@ -1780,8 +2770,16 @@ tagList(exports_card, surveys_card)
 
     const label = document.createElement("div");
     label.className = "label";
-    label.textContent = "Cohorts";
+    label.textContent = "Filter by cohort";
     bar.appendChild(label);
+
+    // Sub-row holding chips on the left and actions on the right.
+    const subRow = document.createElement("div");
+    subRow.style.display = "flex";
+    subRow.style.flexWrap = "wrap";
+    subRow.style.alignItems = "center";
+    subRow.style.gap = "10px";
+    bar.appendChild(subRow);
 
     const chipsWrap = document.createElement("div");
     chipsWrap.className = "chips";
@@ -1807,7 +2805,7 @@ tagList(exports_card, surveys_card)
       });
       chipsWrap.appendChild(chip);
     });
-    bar.appendChild(chipsWrap);
+    subRow.appendChild(chipsWrap);
 
     const actions = document.createElement("div");
     actions.className = "cvm-filter-actions";
@@ -1829,7 +2827,7 @@ tagList(exports_card, surveys_card)
       }, 3000);
     });
     actions.appendChild(selAll); actions.appendChild(clear);
-    bar.appendChild(actions);
+    subRow.appendChild(actions);
 
     nav.parentNode.insertBefore(bar, nav.nextSibling);
   }
@@ -1853,6 +2851,303 @@ tagList(exports_card, surveys_card)
   }
   window.addEventListener("load", runOnce);
   setTimeout(runOnce, 300);
+})();
+</script>
+<script>
+// downloadTagsetCSV — bound to the global scope so the inline onclick
+// handler on each heatmap's "Download CSV" button can call it. Reads
+// the per-tagset payload from <script id="cvm-tag-data"> emitted at
+// render time and synthesizes a CSV file in the browser.
+window.CVM_TAG_DATA = (function() {
+  try {
+    var el = document.getElementById("cvm-tag-data");
+    if (!el) return {};
+    return JSON.parse(el.textContent) || {};
+  } catch (e) { console.warn("CVM_TAG_DATA parse failed", e); return {}; }
+})();
+window.downloadTagsetCSV = function(tagset, label) {
+  var data = window.CVM_TAG_DATA && window.CVM_TAG_DATA[tagset];
+  if (!data) { alert("No data available for " + label); return; }
+  var cohorts = Object.keys(data);
+  var tags = [];
+  cohorts.forEach(function(c) {
+    Object.keys(data[c]).forEach(function(t) {
+      if (tags.indexOf(t) < 0) tags.push(t);
+    });
+  });
+  var rows = [["Tag"].concat(cohorts)];
+  tags.forEach(function(t) {
+    var row = [t];
+    cohorts.forEach(function(c) { row.push(data[c][t] || 0); });
+    rows.push(row);
+  });
+  var csv = rows.map(function(r) {
+    return r.map(function(v) {
+      return '"' + String(v).replace(/"/g, '""') + '"';
+    }).join(",");
+  }).join("\n");
+  var blob = new Blob([csv], { type: "text/csv" });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = label + "_coverage.csv";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+};
+</script>
+<script>
+// --- Feedback widget (every tab) -----------------------------------------
+// Fixed bottom-right button that expands to a small form. On submit, the
+// values are POSTed to a Google Form's formResponse endpoint via a hidden
+// HTML form targeting an off-screen iframe. No API key and no sheet
+// permissions are required — Google Forms accepts public submissions by
+// design — and CORS is dodged because the submission is a same-document
+// HTML form post, not a fetch().
+(function() {
+  "use strict";
+
+  function readJson(id) {
+    var el = document.getElementById(id);
+    if (!el) return null;
+    try { return JSON.parse(el.textContent); }
+    catch (e) { console.error("feedback widget: parse failed for", id, e); return null; }
+  }
+  var CFG = readJson("cvm-feedback-config") || {};
+  var TABS = ["Overview", "Assessment Performance", "Curriculum Tag Coverage",
+              "Cross-Year Comparison", "Course Insights", "Downloads",
+              "Survey Trends"];
+
+  function submitFeedback(tabName, courseCode, feedbackText) {
+    var FORM_ID         = CFG.form_id         || "";
+    var ENTRY_TAB       = CFG.entry_tab       || "";
+    var ENTRY_COURSE    = CFG.entry_course    || "";
+    var ENTRY_FEEDBACK  = CFG.entry_feedback  || "";
+    var ENTRY_TIMESTAMP = CFG.entry_timestamp || "";
+
+    if (!FORM_ID || !ENTRY_TAB) {
+      return Promise.reject(new Error("Google Form not configured"));
+    }
+
+    var formUrl = "https://docs.google.com/forms/d/e/" + FORM_ID + "/formResponse";
+    var params = new URLSearchParams();
+    params.set(ENTRY_TAB, tabName);
+    if (ENTRY_COURSE)    params.set(ENTRY_COURSE,    courseCode);
+    if (ENTRY_FEEDBACK)  params.set(ENTRY_FEEDBACK,  feedbackText);
+    if (ENTRY_TIMESTAMP) params.set(ENTRY_TIMESTAMP, new Date().toISOString());
+
+    var iframe = document.createElement("iframe");
+    iframe.style.display = "none";
+    iframe.name = "cvm-fb-target-" + Date.now();
+    document.body.appendChild(iframe);
+
+    var form = document.createElement("form");
+    form.method = "POST";
+    form.action = formUrl;
+    form.target = iframe.name;
+    form.style.display = "none";
+
+    params.forEach(function(val, key) {
+      var input = document.createElement("input");
+      input.type = "hidden";
+      input.name = key;
+      input.value = val;
+      form.appendChild(input);
+    });
+
+    document.body.appendChild(form);
+    form.submit();
+
+    setTimeout(function() {
+      try { document.body.removeChild(form); }   catch (e) {}
+      try { document.body.removeChild(iframe); } catch (e) {}
+    }, 3000);
+
+    return Promise.resolve();
+  }
+
+  function buildButton() {
+    if (document.querySelector(".cvm-feedback-button")) return;
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cvm-feedback-button";
+    btn.textContent = "Give Feedback";
+    btn.setAttribute("aria-label", "Open feedback form");
+    btn.addEventListener("click", togglePanel);
+    document.body.appendChild(btn);
+  }
+
+  function buildPanel() {
+    if (document.querySelector(".cvm-feedback-panel")) return;
+    var panel = document.createElement("div");
+    panel.className = "cvm-feedback-panel";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "Submit feedback");
+
+    var h = document.createElement("h3"); h.textContent = "Share feedback";
+    panel.appendChild(h);
+
+    // Group all interactive form fields under .cvm-fb-fields so we can
+    // hide them en masse when swapping to the thank-you state.
+    var fieldsWrap = document.createElement("div");
+    fieldsWrap.className = "cvm-fb-fields";
+    panel.appendChild(fieldsWrap);
+
+    var lblTab = document.createElement("label");
+    lblTab.textContent = "Which tab are you on?";
+    lblTab.setAttribute("for", "cvm-fb-tab");
+    fieldsWrap.appendChild(lblTab);
+
+    var sel = document.createElement("select");
+    sel.id = "cvm-fb-tab";
+    TABS.forEach(function(t) {
+      var opt = document.createElement("option");
+      opt.value = t; opt.textContent = t;
+      sel.appendChild(opt);
+    });
+    fieldsWrap.appendChild(sel);
+
+    var lblFb = document.createElement("label");
+    lblFb.textContent = "Your feedback";
+    lblFb.setAttribute("for", "cvm-fb-text");
+    fieldsWrap.appendChild(lblFb);
+
+    var ta = document.createElement("textarea");
+    ta.id = "cvm-fb-text";
+    ta.placeholder = "What's working? What's missing?";
+    fieldsWrap.appendChild(ta);
+
+    var status = document.createElement("div");
+    status.className = "cvm-feedback-status";
+    fieldsWrap.appendChild(status);
+
+    var actions = document.createElement("div");
+    actions.className = "cvm-fb-actions";
+
+    var cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cvm-fb-cancel";
+    cancel.textContent = "Close";
+    cancel.addEventListener("click", togglePanel);
+
+    var submit = document.createElement("button");
+    submit.type = "button";
+    submit.className = "cvm-fb-submit";
+    submit.textContent = "Submit";
+
+    actions.appendChild(cancel);
+    actions.appendChild(submit);
+    fieldsWrap.appendChild(actions);
+
+    // Thank-you overlay — hidden by default, swapped in for the fields
+    // group on successful submit. The page never reloads or navigates;
+    // the overlay auto-hides after 3 s and the fields restore for the
+    // next visit.
+    var thankYouDiv = document.createElement("div");
+    thankYouDiv.className = "cvm-fb-thankyou";
+    thankYouDiv.style.display = "none";
+    thankYouDiv.style.cssText = "padding:24px 16px;text-align:center;";
+    thankYouDiv.innerHTML =
+      '<div style="width:48px;height:48px;background:#E8F5E9;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px auto;">' +
+      '<span style="font-size:24px;">✓</span></div>' +
+      '<div style="font-size:16px;font-weight:600;color:#003F6B;margin-bottom:8px;">Thank you!</div>' +
+      '<div style="font-size:13px;color:#5A6472;line-height:1.6;">Your feedback has been received.<br>We appreciate you taking the time.</div>';
+    panel.appendChild(thankYouDiv);
+
+    if (!CFG.enabled) {
+      status.className = "cvm-feedback-status info";
+      status.textContent =
+        "To enable feedback recording: create a Google Form and set " +
+        "CVM_FEEDBACK_FORM_ID and entry IDs in ~/.Renviron. " +
+        "See setup.R for instructions.";
+      submit.disabled = true;
+    } else {
+      submit.addEventListener("click", function() {
+        var text = (ta.value || "").trim();
+        if (!text) {
+          status.className = "cvm-feedback-status err";
+          status.textContent = "Please enter some feedback before submitting.";
+          return;
+        }
+
+        var FORM_ID = CFG.form_id || "";
+        var ENTRY_TAB = CFG.entry_tab || "";
+        var ENTRY_COURSE = CFG.entry_course || "";
+        var ENTRY_FEEDBACK = CFG.entry_feedback || "";
+
+        if (!FORM_ID) {
+          status.className = "cvm-feedback-status err";
+          status.textContent = "Feedback form not configured.";
+          return;
+        }
+
+        // Build prefilled formResponse URL. The hidden-iframe POST that
+        // preceded this code path was being silently dropped by Google's
+        // X-Frame-Options policy; opening the URL in a tiny offscreen
+        // window forces the request to actually run, then we close the
+        // window after a beat so the user sees nothing more than the
+        // thank-you state.
+        var formUrl = "https://docs.google.com/forms/d/e/" + FORM_ID + "/formResponse";
+        var params = new URLSearchParams();
+        if (ENTRY_TAB) params.set(ENTRY_TAB, sel.value || "");
+        if (ENTRY_COURSE) params.set(ENTRY_COURSE, CFG.course_code || "");
+        if (ENTRY_FEEDBACK) params.set(ENTRY_FEEDBACK, text);
+        params.set("submit", "Submit");
+
+        var win = window.open(
+          formUrl + "?" + params.toString(),
+          "_blank",
+          "width=1,height=1,left=-1000,top=-1000"
+        );
+        setTimeout(function() {
+          try { if (win) win.close(); } catch (e) {}
+        }, 2000);
+
+        // In-panel thank-you overlay. The page never reloads or
+        // navigates; we hide the form group, show the overlay, and then
+        // 3 s later auto-close the panel and restore the form so the
+        // widget is fresh next time the user opens it.
+        submit.disabled = true;
+        ta.value = "";
+        sel.selectedIndex = 0;
+        status.className = "cvm-feedback-status ok";
+        status.textContent = "";
+
+        var formFields = panel.querySelector(".cvm-fb-fields");
+        var thankYou   = panel.querySelector(".cvm-fb-thankyou");
+        if (formFields) formFields.style.display = "none";
+        if (thankYou)   thankYou.style.display   = "block";
+
+        setTimeout(function() {
+          panel.classList.remove("open");
+          // Reset for the next open; staggered slightly so the close
+          // animation completes before the form re-appears.
+          setTimeout(function() {
+            if (formFields) formFields.style.display = "block";
+            if (thankYou)   thankYou.style.display   = "none";
+            submit.disabled = false;
+            status.textContent = "";
+          }, 400);
+        }, 3000);
+      });
+    }
+
+    document.body.appendChild(panel);
+  }
+
+  function togglePanel() {
+    var panel = document.querySelector(".cvm-feedback-panel");
+    if (!panel) return;
+    panel.classList.toggle("open");
+  }
+
+  function init() {
+    buildButton();
+    buildPanel();
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
 })();
 </script>
 ```

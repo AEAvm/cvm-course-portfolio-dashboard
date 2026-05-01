@@ -275,6 +275,8 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
 
   meds <- vapply(all_data, function(r) r$kpi$overall_median %||% NA_real_, numeric(1))
   meds_ok <- meds[is.finite(meds)]
+  q1s  <- vapply(all_data, function(r) r$kpi$q1 %||% NA_real_, numeric(1))
+  q3s  <- vapply(all_data, function(r) r$kpi$q3 %||% NA_real_, numeric(1))
 
   course_code <- all_data[[length(all_data)]]$course_code
   course_name <- all_data[[length(all_data)]]$course_name
@@ -289,13 +291,20 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
       format(total_students, big.mark = ",")
     )
   } else {
+    pooled_q1 <- mean(q1s, na.rm = TRUE)
+    pooled_q3 <- mean(q3s, na.rm = TRUE)
+    iqr_phrase <- if (is.finite(pooled_q1) && is.finite(pooled_q3)) {
+      sprintf(" Pooled IQR across cohorts is %.1f%%–%.1f%%.",
+              pooled_q1, pooled_q3)
+    } else ""
     sprintf(
-      "%s %s has been delivered to %d cohort%s between %s and %s, with a total of %s students assessed. Overall median grades have ranged from %.1f to %.1f across cohorts.",
+      "%s %s has been delivered to %d cohort%s between %s and %s, with a total of %s students assessed. Overall median grades have ranged from %.1f to %.1f across cohorts.%s",
       course_code, course_name,
       length(all_data), if (length(all_data) == 1) "" else "s",
       first_year %||% "unknown", last_year %||% "unknown",
       format(total_students, big.mark = ","),
-      min(meds_ok), max(meds_ok)
+      min(meds_ok), max(meds_ok),
+      iqr_phrase
     )
   }
 
@@ -320,11 +329,21 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
     low_flag <- any(meds_ok < 85)
     hi_flag  <- any(meds_ok > 100)
 
+    fmt_med_iqr <- function(idx) {
+      m <- meds[[idx]]; q1 <- q1s[[idx]]; q3 <- q3s[[idx]]
+      if (is.finite(q1) && is.finite(q3)) {
+        sprintf("median %.1f%% (IQR: %.1f–%.1f%%)", m, q1, q3)
+      } else sprintf("median %.1f%%", m)
+    }
     parts <- c(
-      sprintf("The highest-performing cohort is %s (median %.1f); the lowest is %s (median %.1f).",
-              best_lab, meds[[best_idx]], worst_lab, meds[[worst_idx]]),
-      sprintf("Delivery consistency across cohorts is %s (coefficient of variation: %.2f%%).",
-              tolower(consistency$label), consistency$cv %||% NA)
+      sprintf("The highest-performing cohort is %s (%s); the lowest is %s (%s).",
+              best_lab, fmt_med_iqr(best_idx),
+              worst_lab, fmt_med_iqr(worst_idx)),
+      sprintf("Across the last %d cohort%s, delivery consistency on %% ≥ 80 is %s CV (%.2f%%) — Low CV indicates stable delivery, High CV indicates year-to-year inconsistency.",
+              consistency$n_used %||% length(meds_ok),
+              if ((consistency$n_used %||% length(meds_ok)) == 1) "" else "s",
+              tolower(consistency$label %||% "unknown"),
+              consistency$cv %||% NA)
     )
     if (low_flag) {
       below <- cohort_labels[which(meds < 85)]
@@ -390,11 +409,14 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
       max(ts_avg, na.rm = TRUE), pretty_ts[which.max(ts_avg)]
     ))
     if (length(below) > 0) {
-      below_names <- pretty_ts[which(!is.na(ts_avg) & ts_avg < 50)]
+      below_idx <- which(!is.na(ts_avg) & ts_avg < 50)
+      below_names <- pretty_ts[below_idx]
+      bullets <- paste(sprintf("- %s (tag set)", below_names),
+                       collapse = "\n")
       parts <- c(parts, sprintf(
-        "%s below 50%% average coverage and may need curriculum mapping review: %s.",
+        "%s below 50%% average coverage and may need curriculum mapping review:\n\n%s",
         if (length(below_names) == 1) "This tag set is" else "These tag sets are",
-        paste(below_names, collapse = ", ")
+        bullets
       ))
       add_flag(
         sprintf("Tag sets with < 50%% average coverage: %s",
@@ -403,7 +425,7 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
         "Schedule a curriculum mapping session to confirm which course objectives should tag these taxonomies."
       )
     }
-    paste(parts, collapse = " ")
+    paste(parts, collapse = "\n\n")
   }
 
   # ---- Paragraph 4 — trends ----------------------------------------------
@@ -426,6 +448,23 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
   tag_stats <- compute_tag_stats(cohort_counts_by_ts)
   td <- build_tag_delta(all_data)
 
+  # Tag mentions render as markdown bullet lists ("- tag name (tag set)")
+  # so the narrative pane shows them as a clean enumerated list rather than
+  # a long run-on sentence. The narrative renderer (markdown_to_html) emits
+  # <ul> for these bullets.
+  bullet_block <- function(rows, tag_col, tagset_col, suffix_fn = NULL) {
+    if (nrow(rows) == 0) return(character(0))
+    pretty_ts_col <- if (exists("pretty_tagset_name", mode = "function")) {
+      pretty_tagset_name(rows[[tagset_col]])
+    } else rows[[tagset_col]]
+    lines <- vapply(seq_len(nrow(rows)), function(i) {
+      base <- sprintf("- %s (%s)", rows[[tag_col]][[i]], pretty_ts_col[[i]])
+      if (!is.null(suffix_fn)) paste0(base, suffix_fn(rows[i, , drop = FALSE]))
+      else base
+    }, character(1))
+    paste(lines, collapse = "\n")
+  }
+
   p4 <- if (nrow(tag_stats) == 0) {
     "Trend analysis requires tag-coverage data across cohorts and could not be computed."
   } else {
@@ -433,15 +472,15 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
     top_v <- top_variable_tags(tag_stats, 3)
     parts <- c()
     if (nrow(top_c) > 0) {
-      parts <- c(parts, sprintf(
-        "The most consistently covered tags across cohorts are %s — reliably present in every cohort.",
-        paste(sprintf("%s (%s)", top_c$tag, top_c$tagset), collapse = "; ")
+      parts <- c(parts, paste0(
+        "The most consistently covered tags across cohorts are reliably present in every cohort:\n\n",
+        bullet_block(top_c, "tag", "tagset")
       ))
     }
     if (nrow(top_v) > 0) {
-      parts <- c(parts, sprintf(
-        "The most variable tags are %s — coverage fluctuates between cohorts and may indicate inconsistent curriculum mapping.",
-        paste(sprintf("%s (%s)", top_v$tag, top_v$tagset), collapse = "; ")
+      parts <- c(parts, paste0(
+        "The most variable tags fluctuate between cohorts and may indicate inconsistent curriculum mapping:\n\n",
+        bullet_block(top_v, "tag", "tagset")
       ))
     }
     if (length(td) > 0) {
@@ -454,15 +493,17 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
         lost   <- all_deltas |> dplyr::filter(.data$delta < 0) |>
                    dplyr::arrange(.data$delta)                |> head(3)
         if (nrow(gained) > 0) {
-          parts <- c(parts, sprintf(
-            "Tags with the largest gain between the earliest and latest cohort: %s.",
-            paste(sprintf("%s (%+d)", gained$tag, gained$delta), collapse = "; ")
+          parts <- c(parts, paste0(
+            "Tags with the largest gain between the earliest and latest cohort:\n\n",
+            bullet_block(gained, "tag", "tagset",
+                         suffix_fn = function(r) sprintf(" %+d", r$delta))
           ))
         }
         if (nrow(lost) > 0) {
-          parts <- c(parts, sprintf(
-            "Tags with the largest drop: %s.",
-            paste(sprintf("%s (%+d)", lost$tag, lost$delta), collapse = "; ")
+          parts <- c(parts, paste0(
+            "Tags with the largest drop:\n\n",
+            bullet_block(lost, "tag", "tagset",
+                         suffix_fn = function(r) sprintf(" %+d", r$delta))
           ))
           add_flag(
             sprintf("Coverage drop between cohorts for: %s",
@@ -473,7 +514,7 @@ generate_rule_based_narrative <- function(all_data, cohort_colors = NULL,
         }
       }
     }
-    paste(parts, collapse = " ")
+    paste(parts, collapse = "\n\n")
   }
 
   # ---- Paragraph 5 — closing --------------------------------------------

@@ -199,16 +199,49 @@ cache_path <- function(cohort_label, course_code, file = NULL, root = project_ro
   if (!is.null(file)) file.path(dir, file) else dir
 }
 
-#' Per-class surveys folder path. Convention:
-#'   outputs/{course_code}_{class_slug}/surveys/
-#' (A separate parent folder from the dashboard folder, which is named
-#' {course_code}_{course_name}.) PDFs are dropped here manually; no content
-#' is generated automatically. The folder is created by render_dashboard.R
-#' only once the cohort's latest period_finish_date + 2 days has passed.
-surveys_dir <- function(course_code, cohort_label, root = outputs_dir()) {
+#' Sanitize a course name the same way course_folder() does, so the per-
+#' course directory name composed by surveys_dir / feedback_dir / downloads_dir
+#' lines up with the dashboard's main folder (outputs/{code}_{name}/).
+.safe_course_segment <- function(course_name) {
+  safe_name <- gsub("[^A-Za-z0-9]+", "_", course_name)
+  sub("_+$", "", safe_name)
+}
+
+#' Per-class surveys folder path. New convention (one folder per course):
+#'   outputs/{course_code}_{course_name}/surveys/{class_slug}/
+#' PDFs are dropped here manually; the render ensures the directory exists
+#' once the cohort's latest period_finish_date + 2 days has passed.
+surveys_dir <- function(course_code, course_name, cohort_label,
+                        root = outputs_dir()) {
   safe_code <- gsub("[^A-Za-z0-9]", "", course_code)
+  safe_name <- .safe_course_segment(course_name)
   slug <- cohort_slug(cohort_label)
-  file.path(root, sprintf("%s_%s", safe_code, slug), "surveys")
+  file.path(root, sprintf("%s_%s", safe_code, safe_name), "surveys", slug)
+}
+
+#' Per-class student-feedback folders (mid-course + delta). New convention:
+#'   outputs/{course_code}_{course_name}/feedback/{class_slug}/midcourse/
+#'   outputs/{course_code}_{course_name}/feedback/{class_slug}/delta/
+#' PDFs are dropped manually; the render only ensures the folders exist.
+feedback_dir <- function(course_code, course_name, cohort_label, kind,
+                         root = outputs_dir()) {
+  stopifnot(kind %in% c("midcourse", "delta"))
+  safe_code <- gsub("[^A-Za-z0-9]", "", course_code)
+  safe_name <- .safe_course_segment(course_name)
+  slug <- cohort_slug(cohort_label)
+  file.path(root, sprintf("%s_%s", safe_code, safe_name),
+            "feedback", slug, kind)
+}
+
+#' Course-level general downloads folder. Anything Ish drops here is
+#' auto-listed in the Downloads tab — no schema, no naming convention. PDFs,
+#' XLSX, PPTX, CSV, ZIP, etc. are all surfaced.
+#'   outputs/{course_code}_{course_name}/downloads/
+downloads_dir <- function(course_code, course_name,
+                          root = outputs_dir()) {
+  safe_code <- gsub("[^A-Za-z0-9]", "", course_code)
+  safe_name <- .safe_course_segment(course_name)
+  file.path(root, sprintf("%s_%s", safe_code, safe_name), "downloads")
 }
 
 # Root of the existing Box-hosted course portfolio folder. Used ONLY to
@@ -331,6 +364,40 @@ copy_box_survey_pdfs <- function(course_code, cohort_label, target_dir,
     }
   }
   copied
+}
+
+#' Extract every text page out of a survey PDF and concatenate. Wraps
+#' `pdftools::pdf_text()` with a tryCatch so a bad / encrypted / image-only
+#' PDF doesn't kill the render — we just emit a warning and return NULL.
+#' Used by `analyse_survey_trends()` for the Survey Trends tab.
+extract_survey_text <- function(pdf_path) {
+  if (!requireNamespace("pdftools", quietly = TRUE)) {
+    warning("pdftools not installed; cannot extract survey text")
+    return(NULL)
+  }
+  tryCatch({
+    text <- pdftools::pdf_text(pdf_path)
+    paste(text, collapse = "\n")
+  }, error = function(e) {
+    warning(sprintf("Could not read PDF: %s — %s",
+                    basename(pdf_path), conditionMessage(e)))
+    NULL
+  })
+}
+
+#' Strip noisy header / metadata lines from a survey PDF text dump before
+#' showing it on the dashboard. The cvm.gradebook survey export prepends
+#' "Report download date:", "Report Start Date:", "Report End Date:",
+#' "Completed Forms on …" and a "Form:" line that have no analytic value.
+clean_survey_text <- function(text) {
+  if (is.null(text) || !nzchar(text)) return(text)
+  text <- gsub("Report download date:[^\n]*\n?", "", text, ignore.case = TRUE)
+  text <- gsub("Report Start Date:[^\n]*\n?",   "", text, ignore.case = TRUE)
+  text <- gsub("Report End Date:[^\n]*\n?",     "", text, ignore.case = TRUE)
+  text <- gsub("Completed Forms on[^\n]*\n?",   "", text, ignore.case = TRUE)
+  text <- gsub("Form:[^\n]*\n?",                "", text, ignore.case = TRUE)
+  text <- gsub("\\s{3,}", "  ", text)
+  trimws(text)
 }
 
 #' Human-readable bytes.

@@ -36,7 +36,8 @@ setwd(script_dir)
 
 for (f in c("utils.R", "data_layer.R", "portfolio_runner.R",
             "comparison_engine.R", "ai_interpret.R",
-            "plot_helpers.R", "html_components.R", "render_helpers.R")) {
+            "plot_helpers.R", "html_components.R", "render_helpers.R",
+            "layout_fixes.R")) {
   source(file.path("R", f), local = FALSE)
 }
 
@@ -62,6 +63,39 @@ course_id <- as.integer(course_id_arg)
 
 mode_str <- if (all_classes) "all-classes" else sprintf("class=%s", class_arg)
 render_log(sprintf("START render_dashboard  course_id=%s  %s", course_id, mode_str))
+
+# ---- Feedback widget credentials -------------------------------------------
+# Hardcoded defaults so the "Give Feedback" widget works out of the box with
+# zero .Renviron setup. Setting any of these vars in ~/.Renviron overrides the
+# corresponding default — useful for swapping the production form for a test
+# form without code changes. We Sys.setenv() the resolved values before
+# calling quarto::quarto_render() so the .qmd's existing Sys.getenv() reads
+# pick them up unchanged.
+feedback_form_id        <- if (nzchar(Sys.getenv("CVM_FEEDBACK_FORM_ID")))
+                             Sys.getenv("CVM_FEEDBACK_FORM_ID") else
+                             "1FAIpQLSf9y2ZW0KHaJfuwrMW3PZWBvrfWx540GRtoFd_faPHpomNhxg"
+
+feedback_entry_tab      <- if (nzchar(Sys.getenv("CVM_FEEDBACK_ENTRY_TAB")))
+                             Sys.getenv("CVM_FEEDBACK_ENTRY_TAB") else
+                             "entry.1085077571"
+
+feedback_entry_course   <- if (nzchar(Sys.getenv("CVM_FEEDBACK_ENTRY_COURSE")))
+                             Sys.getenv("CVM_FEEDBACK_ENTRY_COURSE") else
+                             "entry.1439851898"
+
+feedback_entry_feedback <- if (nzchar(Sys.getenv("CVM_FEEDBACK_ENTRY_FEEDBACK")))
+                             Sys.getenv("CVM_FEEDBACK_ENTRY_FEEDBACK") else
+                             "entry.1980040184"
+
+feedback_enabled <- TRUE
+
+Sys.setenv(
+  CVM_FEEDBACK_FORM_ID        = feedback_form_id,
+  CVM_FEEDBACK_ENTRY_TAB      = feedback_entry_tab,
+  CVM_FEEDBACK_ENTRY_COURSE   = feedback_entry_course,
+  CVM_FEEDBACK_ENTRY_FEEDBACK = feedback_entry_feedback
+)
+render_log(sprintf("feedback widget enabled (form_id=%s)", feedback_form_id))
 
 # ---- Offline validation -----------------------------------------------------
 course_rows <- load_course_ids()
@@ -184,7 +218,7 @@ exit_status <- tryCatch({
     for (r in all_data) {
       mf <- r$max_period_finish_date
       if (!is.null(mf) && !is.na(mf) && (as.Date(mf) + 2) <= Sys.Date()) {
-        s_dir <- surveys_dir(r$course_code, r$cohort_label)
+        s_dir <- surveys_dir(r$course_code, r$course_name, r$cohort_label)
         if (!dir.exists(s_dir)) {
           ensure_dir(s_dir)
           render_log(sprintf("surveys folder ready -> %s", s_dir))
@@ -196,6 +230,22 @@ exit_status <- tryCatch({
           logger        = render_log
         )
       }
+      # Student feedback folders (midcourse + delta) — created on every
+      # render regardless of period_finish_date, so faculty can drop PDFs
+      # the moment they receive them mid-semester.
+      for (kind in c("midcourse", "delta")) {
+        f_dir <- feedback_dir(r$course_code, r$course_name, r$cohort_label, kind)
+        if (!dir.exists(f_dir)) {
+          ensure_dir(f_dir)
+          render_log(sprintf("feedback/%s folder ready -> %s", kind, f_dir))
+        }
+      }
+    }
+    # Course-level general downloads folder — drop-anything sink.
+    dl_dir <- downloads_dir(latest$course_code, latest$course_name)
+    if (!dir.exists(dl_dir)) {
+      ensure_dir(dl_dir)
+      render_log(sprintf("downloads folder ready -> %s", dl_dir))
     }
 
     # ---- Cohort-scale sanity check ------------------------------------
@@ -232,6 +282,9 @@ exit_status <- tryCatch({
     )
     move_quarto_outputs(output_html, course_dir)
     render_log("render OK")
+    output_path <- file.path(course_dir, output_html)
+    apply_layout_fixes(output_path)
+    render_log(sprintf("layout_fixes: applied -> %s", basename(output_path)))
 
     if (save_fixture) {
       fx_dir <- file.path(project_root(), "tests", "fixtures")
@@ -308,11 +361,23 @@ exit_status <- tryCatch({
     max_finish <- result$max_period_finish_date
     if (!is.null(max_finish) && !is.na(max_finish) &&
         (as.Date(max_finish) + 2) <= Sys.Date()) {
-      s_dir <- surveys_dir(result$course_code, cohort)
+      s_dir <- surveys_dir(result$course_code, result$course_name, cohort)
       if (!dir.exists(s_dir)) {
         ensure_dir(s_dir)
         render_log(sprintf("surveys folder ready -> %s", s_dir))
       }
+    }
+    for (kind in c("midcourse", "delta")) {
+      f_dir <- feedback_dir(result$course_code, result$course_name, cohort, kind)
+      if (!dir.exists(f_dir)) {
+        ensure_dir(f_dir)
+        render_log(sprintf("feedback/%s folder ready -> %s", kind, f_dir))
+      }
+    }
+    dl_dir <- downloads_dir(result$course_code, result$course_name)
+    if (!dir.exists(dl_dir)) {
+      ensure_dir(dl_dir)
+      render_log(sprintf("downloads folder ready -> %s", dl_dir))
     }
 
     if (with_exports) build_export_artifacts(conn$pool, result, course_dir)
@@ -331,6 +396,9 @@ exit_status <- tryCatch({
     )
     move_quarto_outputs(output_html, course_dir)
     render_log("render OK")
+    output_path <- file.path(course_dir, output_html)
+    apply_layout_fixes(output_path)
+    render_log(sprintf("layout_fixes: applied -> %s", basename(output_path)))
 
     if (save_fixture) {
       fx_dir <- file.path(project_root(), "tests", "fixtures")

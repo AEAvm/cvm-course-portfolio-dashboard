@@ -500,6 +500,102 @@ tag_heatmap_plotly_multi <- function(cohort_counts, cohort_colors,
     plotly::config(displaylogo = FALSE, responsive = TRUE)
 }
 
+#' Multi-cohort tag plot in the PPT export style.
+#'
+#' Visual contract (matches the PowerPoint pages produced by
+#' `cvm.course.portfolio::generate_tagset_plots()`, adapted for the web):
+#'   * horizontal grouped bar chart — one bar per cohort per tag
+#'   * tags on the y-axis with their full label text (no rotation, no truncation)
+#'   * tags sorted by total count across cohorts (largest at the top)
+#'   * one color per cohort, taken from `cohort_colors` (the dashboard's
+#'     palette) so the page is internally consistent
+#'   * white background, minimal gridlines, navy bold title, legend below
+#'
+#' Inputs match `tag_bar_plotly_multi()` (named list of named integer
+#' vectors, one per cohort) so callers can swap the two without rewiring.
+#' Returns a list with `$plot` (plotly htmlwidget) and `$deprecated_count`
+#' for parity with the bar/heatmap helpers.
+tag_pkg_style_plotly_multi <- function(cohort_counts, cohort_colors,
+                                       title = "Tag coverage",
+                                       height = NULL) {
+  labels <- names(cohort_counts)
+  labels <- labels[vapply(cohort_counts[labels],
+                          function(x) !is.null(x) && length(x) > 0, logical(1))]
+
+  empty <- function(msg) list(
+    plot = plotly::plot_ly() |>
+      plotly::layout(title = list(text = paste(title, msg)),
+                     paper_bgcolor = "white", plot_bgcolor = "white",
+                     height = height %||% 380),
+    deprecated_count = 0L
+  )
+  if (length(labels) == 0) return(empty("— no data"))
+
+  all_tags <- unique(unlist(lapply(cohort_counts[labels], names)))
+  if (length(all_tags) == 0) return(empty("— no tags"))
+  dep_mask <- is_deprecated_tag(all_tags)
+  deprecated_count <- sum(dep_mask)
+  all_tags <- all_tags[!dep_mask]
+  if (length(all_tags) == 0) return(empty("— all tags deprecated"))
+
+  # Sort tags by total count across cohorts. Plotly horizontal bars draw
+  # bottom-up, so we reverse the order here to land the largest tag at
+  # the top of the rendered chart.
+  totals <- vapply(all_tags, function(t) {
+    sum(vapply(cohort_counts[labels],
+               function(x) if (t %in% names(x)) as.numeric(x[[t]]) else 0,
+               numeric(1)), na.rm = TRUE)
+  }, numeric(1))
+  ord <- order(totals)            # ascending → bottom→top once plotted
+  all_tags <- all_tags[ord]
+
+  # Plot height: 26px per tag row + chrome, floor 460, ceiling 1600.
+  h <- height %||% max(460, min(1600, 140 + 26 * length(all_tags)))
+
+  p <- plotly::plot_ly(height = h)
+  for (lab in labels) {
+    cc <- cohort_counts[[lab]]
+    x_vals <- vapply(all_tags, function(t) {
+      if (t %in% names(cc)) as.numeric(cc[[t]]) else 0
+    }, numeric(1))
+    col <- unname(cohort_colors[[lab]] %||% CVM_PALETTE$navy)
+    p <- p |>
+      plotly::add_bars(
+        x = x_vals,
+        y = factor(all_tags, levels = all_tags),
+        orientation = "h",
+        marker = list(color = col, line = list(color = "#FFFFFF", width = 0.5)),
+        name = lab, legendgroup = lab,
+        hovertemplate = sprintf("%s<br>%%{y}: %%{x}<extra></extra>", lab)
+      )
+  }
+
+  list(
+    plot = p |>
+      plotly::layout(
+        title = list(text = title,
+                     font = list(color = CVM_PALETTE$navy, size = 14)),
+        xaxis = list(title = "Event count",
+                     gridcolor = "#E4E7EC", zeroline = FALSE),
+        yaxis = list(title = "", automargin = TRUE,
+                     # Prevent plotly from re-sorting alphabetically and
+                     # losing our count-based order.
+                     categoryorder = "array",
+                     categoryarray = all_tags),
+        barmode = "group",
+        bargap = 0.25, bargroupgap = 0.05,
+        paper_bgcolor = "white", plot_bgcolor = "white",
+        font = list(color = CVM_PALETTE$text, family = "Inter, sans-serif"),
+        margin = list(t = 50, b = 110, l = 260, r = 40),
+        legend = list(orientation = "h", y = -0.18,
+                      title = list(text = "Class of")),
+        autosize = TRUE
+      ) |>
+      plotly::config(displaylogo = FALSE, responsive = TRUE),
+    deprecated_count = deprecated_count
+  )
+}
+
 #' Convert per-cohort tag_coverage[[ts]] data.frames into the named-integer
 #' shape expected by tag_bar_plotly_multi() and tag_heatmap_plotly_multi().
 #' Input: tagset_df with event_title column + tag columns. Row with event_title

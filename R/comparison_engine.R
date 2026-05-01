@@ -157,62 +157,239 @@ change_narrative <- function(tag_delta_list, top_n = 5) {
 #'   trend ∈ {"up","stable","down","anomaly", NA}; |delta| ≤ 1 → stable.
 compute_cohort_trajectory <- function(all_data) {
   if (length(all_data) == 0) {
-    return(tibble::tibble(cohort = character(), median = numeric(),
-                          prev_cohort = character(), prev_median = numeric(),
-                          delta = numeric(), trend = character()))
+    return(tibble::tibble(
+      cohort = character(), pct_80 = numeric(), median = numeric(),
+      prev_cohort = character(), prev_pct_80 = numeric(),
+      delta = numeric(), trend = character()
+    ))
   }
-  ordered <- all_data[order(vapply(all_data, function(r) r$cohort_label, character(1)))]
-  labels  <- vapply(ordered, function(r) r$cohort_label, character(1))
-  meds    <- vapply(ordered, function(r) r$kpi$overall_median %||% NA_real_, numeric(1))
+  ordered  <- all_data[order(vapply(all_data, function(r) r$cohort_label,
+                                    character(1)))]
+  labels   <- vapply(ordered, function(r) r$cohort_label, character(1))
+  pct_80s  <- vapply(ordered, function(r) r$kpi$pct_80 %||% NA_real_,
+                     numeric(1))
+  meds     <- vapply(ordered, function(r) r$kpi$overall_median %||% NA_real_,
+                     numeric(1))
 
-  is_valid <- is.finite(meds) & meds <= 100
+  is_valid <- is.finite(pct_80s)
 
   prev_lab <- rep(NA_character_, length(labels))
-  prev_med <- rep(NA_real_,      length(labels))
+  prev_p80 <- rep(NA_real_,      length(labels))
   # For each cohort, walk backward to find the most recent VALID baseline.
   for (i in seq_along(labels)) {
     j <- i - 1L
     while (j >= 1L) {
       if (is_valid[[j]]) {
         prev_lab[[i]] <- labels[[j]]
-        prev_med[[i]] <- meds[[j]]
+        prev_p80[[i]] <- pct_80s[[j]]
         break
       }
       j <- j - 1L
     }
   }
-  delta <- ifelse(is_valid & !is.na(prev_med), meds - prev_med, NA_real_)
+  delta <- ifelse(is_valid & !is.na(prev_p80), pct_80s - prev_p80, NA_real_)
+  # Trend bands: ±1 percentage point counts as "stable"; that's tighter than
+  # the median trajectory used (also ±1 absolute) because pct_80 is on a
+  # 0–100 scale and ±1pp is a meaningful drift for a competency metric.
   trend <- dplyr::case_when(
-    !is_valid          ~ "anomaly",       # own median > 100 or non-finite
-    is.na(delta)       ~ NA_character_,   # no prior baseline
+    !is_valid          ~ NA_character_,
+    is.na(delta)       ~ NA_character_,
     abs(delta) <= 1    ~ "stable",
     delta > 0          ~ "up",
     delta < 0          ~ "down"
   )
   tibble::tibble(
     cohort      = labels,
+    pct_80      = round(pct_80s, 1),
     median      = round(meds, 1),
     prev_cohort = prev_lab,
-    prev_median = round(prev_med, 1),
+    prev_pct_80 = round(prev_p80, 1),
     delta       = round(delta, 1),
     trend       = trend
   )
 }
 
-#' Delivery consistency = coefficient of variation of overall medians
-#' across cohorts. Lower = more consistent.
-#' @return list(cv, label ∈ {"High","Medium","Low"}, medians)
+#' Delivery consistency = coefficient of variation of `% ≥ 80` (the share
+#' of students achieving competency) across the LAST 3 cohorts. `% ≥ 80`
+#' is the right metric because it directly measures outcomes (vs. a median
+#' that is sensitive to extra-credit-inflated weighted-overall formulas).
+#' Limiting to the 3 most recent cohorts keeps the score reflective of
+#' current delivery — a 6-year-old cohort tells us little about today.
+#' @return list(cv, label ∈ {"High","Medium","Low"}, pct_80s, n_used,
+#'   cohorts_used, range_min, range_max). `medians` is preserved as an
+#'   alias of `pct_80s` for backwards compatibility with any caller that
+#'   reads the field by its old name.
 compute_consistency_score <- function(all_data) {
-  meds <- vapply(all_data, function(r) r$kpi$overall_median %||% NA_real_, numeric(1))
-  meds <- meds[is.finite(meds)]
-  if (length(meds) < 2) {
-    return(list(cv = NA_real_, label = "Insufficient data", medians = meds))
+  empty <- function() list(
+    cv = NA_real_, label = "Insufficient data",
+    pct_80s = numeric(), medians = numeric(),
+    n_used = 0L, cohorts_used = character(),
+    range_min = NA_real_, range_max = NA_real_
+  )
+  if (length(all_data) == 0) return(empty())
+
+  labels <- vapply(all_data, function(r) r$cohort_label, character(1))
+  ordered <- all_data[order(labels)]
+  ord_labels <- sort(labels)
+  k <- min(3L, length(ordered))
+  recent <- ordered[(length(ordered) - k + 1L):length(ordered)]
+  recent_labels <- ord_labels[(length(ord_labels) - k + 1L):length(ord_labels)]
+  pct_80s <- vapply(recent, function(r) r$kpi$pct_80 %||% NA_real_,
+                    numeric(1))
+  ok <- is.finite(pct_80s)
+  pct_ok <- pct_80s[ok]
+  cohorts_ok <- recent_labels[ok]
+  if (length(pct_ok) < 2) {
+    out <- empty()
+    out$pct_80s <- pct_ok; out$medians <- pct_ok
+    out$n_used <- length(pct_ok); out$cohorts_used <- cohorts_ok
+    return(out)
   }
-  cv <- stats::sd(meds) / mean(meds)
-  label <- if (cv < 0.03) "High"
-           else if (cv < 0.08) "Medium"
-           else "Low"
-  list(cv = round(cv * 100, 2), label = label, medians = meds)
+  # CV on percentage points — both SD and mean live on the same 0–100 scale.
+  cv <- stats::sd(pct_ok) / mean(pct_ok)
+  label <- if (cv < 0.05) "Low"          # < 5% → "stable" per spec
+           else if (cv < 0.15) "Medium"   # 5–15% → "some variation"
+           else "High"                    # > 15% → "significant inconsistency"
+  list(
+    cv = round(cv * 100, 2), label = label,
+    pct_80s = pct_ok, medians = pct_ok,
+    n_used = length(pct_ok), cohorts_used = cohorts_ok,
+    range_min = min(pct_ok), range_max = max(pct_ok)
+  )
+}
+
+#' Smart survey trend extractor.
+#'
+#' Walks every cohort's surveys/{class_slug}/ folder, picks the most-recently
+#' modified PDF, runs it through pdftools, and returns a per-cohort record
+#' that includes the cleaned text AND a parsed list of Likert-style question
+#' agreement scores. Each score is normalized to 0–100:
+#'    SA*2 + A*1 + N*0 + D*-1 + SD*-2  →  rescaled (×50)+50.
+#'
+#' Question detection is keyword-anchored so it survives small layout
+#' changes in the PDF: we look for a fixed list of veterinary-education
+#' survey topics, scan a 250-char window after each match, and pull the
+#' first 5 plausible counts (0–N). When a window yields ≥ 5 numbers the
+#' agreement score is computed; otherwise the keyword is recorded with
+#' an NA score so the trend table still surfaces it.
+#'
+#' @return list of list(cohort, pdf, color, n_words, questions, raw_text)
+#'   where `questions` is a named list keyed by keyword.
+analyse_survey_trends <- function(all_data, cohort_colors) {
+
+  # ── Step 1: per-PDF parser ──────────────────────────────────────────
+  parse_survey_pdf <- function(text, cohort_label) {
+    text <- gsub("\\s+", " ", text)
+
+    survey_keywords <- c(
+      "prepared me for the assessments",
+      "course components",
+      "overall quality",
+      "recommend",
+      "workload",
+      "instructor",
+      "content",
+      "organization",
+      "feedback",
+      "learning objectives",
+      "prework",
+      "TBL",
+      "team-based",
+      "lecture",
+      "case stud"
+    )
+
+    questions <- list()
+    for (kw in survey_keywords) {
+      kw_pos <- regexpr(kw, text, ignore.case = TRUE)
+      if (kw_pos == -1) next
+
+      start <- max(1, kw_pos - 50)
+      end   <- min(nchar(text), kw_pos + 300)
+      chunk <- substr(text, start, end)
+
+      nums  <- as.numeric(regmatches(chunk,
+                                     gregexpr("\\b\\d+\\.?\\d*\\b", chunk))[[1]])
+      nums  <- nums[is.finite(nums) & nums >= 0 & nums <= 1000]
+
+      if (length(nums) >= 3) {
+        agreement <- if (length(nums) >= 5) {
+          counts <- nums[1:5]
+          total  <- sum(counts)
+          if (total > 0) {
+            score <- counts[1] * 2 + counts[2] * 1 + counts[3] * 0 +
+                     counts[4] * -1 + counts[5] * -2
+            round(score / total * 50 + 50, 1)
+          } else NA_real_
+        } else NA_real_
+
+        questions[[kw]] <- list(
+          keyword   = kw,
+          cohort    = cohort_label,
+          raw_nums  = nums[1:min(5, length(nums))],
+          agreement = agreement
+        )
+      }
+    }
+    questions
+  }
+
+  # ── Step 2: walk all cohorts ────────────────────────────────────────
+  all_results <- lapply(names(all_data), function(lab) {
+    r <- all_data[[lab]]
+    s_dir <- surveys_dir(r$course_code, r$course_name, r$cohort_label)
+    if (!dir.exists(s_dir)) return(NULL)
+    pdfs <- list.files(s_dir, pattern = "\\.pdf$", full.names = TRUE)
+    if (length(pdfs) == 0) return(NULL)
+    pdf  <- pdfs[which.max(file.mtime(pdfs))]
+    text <- extract_survey_text(pdf)
+    if (is.null(text) || !nzchar(text)) return(NULL)
+
+    questions <- parse_survey_pdf(text, lab)
+    list(
+      cohort    = lab,
+      pdf       = basename(pdf),
+      color     = unname(cohort_colors[lab] %||% "#003F6B"),
+      n_words   = length(strsplit(text, "\\s+")[[1]]),
+      questions = questions,
+      raw_text  = text
+    )
+  })
+  Filter(Negate(is.null), all_results)
+}
+
+#' Build a tidy keyword × cohort agreement-score table from
+#' `analyse_survey_trends()` output. Adds a `trend` column that classifies
+#' each keyword as improving / stable / declining based on the difference
+#' between the earliest and latest cohort with valid scores (±5 pts band).
+#' @return data.frame with columns: keyword, trend, then one numeric column
+#'   per cohort (in cohort order from the input list).
+build_survey_trend_summary <- function(survey_data) {
+  if (length(survey_data) == 0) return(NULL)
+  all_keywords <- unique(unlist(lapply(survey_data,
+                                       function(d) names(d$questions))))
+  if (length(all_keywords) == 0) return(NULL)
+
+  cohort_order <- vapply(survey_data, function(d) d$cohort, character(1))
+
+  rows <- lapply(all_keywords, function(kw) {
+    scores <- vapply(survey_data, function(d) {
+      q <- d$questions[[kw]]
+      if (is.null(q) || is.na(q$agreement %||% NA_real_)) NA_real_
+      else as.numeric(q$agreement)
+    }, numeric(1))
+    names(scores) <- cohort_order
+    valid <- scores[is.finite(scores)]
+    trend <- if (length(valid) >= 2) {
+      delta <- utils::tail(valid, 1) - utils::head(valid, 1)
+      if (delta > 5) "improving"
+      else if (delta < -5) "declining"
+      else "stable"
+    } else "insufficient data"
+    out <- c(list(keyword = kw, trend = trend), as.list(scores))
+    as.data.frame(out, stringsAsFactors = FALSE, check.names = FALSE)
+  })
+  dplyr::bind_rows(rows)
 }
 
 #' Per-tag stats across cohorts. Input: cohort_counts_by_ts — named list,

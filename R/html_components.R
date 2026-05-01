@@ -60,8 +60,8 @@ ui_kpi_card <- function(label, value, subvalue = NULL, kpi_key = NULL,
     tags$div(
       class = "cvm-kpi-label",
       style = .css(
-        "color:", .CVM$muted, ";",
-        "font-size:11px; font-weight:500;",
+        "color:", .CVM$navy, ";",
+        "font-size:11px; font-weight:600;",
         "text-transform:uppercase; letter-spacing:0.08em;",
         "margin-bottom:14px; line-height:1.2;"
       ),
@@ -255,7 +255,7 @@ ui_deprecated_note <- function(n) {
     style = .css(
       "color:", .CVM$muted, "; font-size:11px; font-style:italic; margin-top:10px;"
     ),
-    sprintf("%d deprecated %s hidden.", n, if (n == 1) "tag" else "tags")
+    "Deprecated tags excluded."
   )
 }
 

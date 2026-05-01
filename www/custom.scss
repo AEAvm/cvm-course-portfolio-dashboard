@@ -2,7 +2,7 @@
 // CVM Quarto dashboard theme. Composes with Quarto's default Bootstrap 5 theme
 // via the `theme: [default, lib/custom.scss]` YAML entry in every template.
 
-// Brand tokens
+// ── Brand tokens ────────────────────────────────────────────────────────────
 $cvm-navy:       #003F6B;
 $cvm-navy-dark:  #002D4D;
 $cvm-gold:       #AB8B00;
@@ -16,7 +16,7 @@ $cvm-success:    #2E7D32;
 $cvm-warning:    #F57C00;
 $cvm-alert:      #C62828;
 
-// Bootstrap overrides
+// ── Bootstrap overrides ──────────────────────────────────────────────────────
 $primary:        $cvm-navy;
 $secondary:      $cvm-gold;
 $success:        $cvm-success;
@@ -26,14 +26,15 @@ $body-bg:        $cvm-bg;
 $body-color:     $cvm-text;
 $border-radius:  8px;
 
-// Fonts — web-safe stack with Inter first if installed locally.
+// ── Typography ───────────────────────────────────────────────────────────────
+// Web-safe stack with Inter first if installed locally.
 $font-family-sans-serif: "Inter", "Source Sans Pro", -apple-system,
   BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 $headings-font-family:   $font-family-sans-serif;
 $font-size-base:         0.95rem;
 $headings-color:         $cvm-navy;
 
-// Quarto dashboard value-box colors
+// ── Quarto dashboard value-box colors ────────────────────────────────────────
 $dashboard-value-box-primary-bg:   $cvm-navy;
 $dashboard-value-box-secondary-bg: $cvm-gold;
 
@@ -49,27 +50,30 @@ $dashboard-value-box-secondary-bg: $cvm-gold;
 // @font-face { font-family: "Inter"; font-weight: 600; src: url("fonts/Inter-SemiBold.woff2") format("woff2"); }
 // @font-face { font-family: "Inter"; font-weight: 700; src: url("fonts/Inter-Bold.woff2") format("woff2"); }
 
-// CSS variables mirror SCSS tokens so inline styles in the .qmd can refer
-// to them without re-importing SCSS.
+// ── CSS custom properties ────────────────────────────────────────────────────
+// Mirror SCSS tokens so inline styles in the .qmd can reference them without
+// re-importing SCSS.
 :root {
-  --cvm-navy:      #{$cvm-navy};
-  --cvm-navy-dark: #{$cvm-navy-dark};
-  --cvm-gold:      #{$cvm-gold};
-  --cvm-gold-light:#{$cvm-gold-light};
-  --cvm-bg:        #{$cvm-bg};
-  --cvm-white:     #{$cvm-white};
-  --cvm-text:      #{$cvm-text};
-  --cvm-muted:     #{$cvm-muted};
-  --cvm-border:    #{$cvm-border};
-  --cvm-success:   #{$cvm-success};
-  --cvm-warning:   #{$cvm-warning};
-  --cvm-alert:     #{$cvm-alert};
-  --cvm-shadow:    0 2px 8px rgba(0,0,0,0.08);
-  --cvm-shadow-lg: 0 4px 16px rgba(0,0,0,0.10);
+  --cvm-navy:       #{$cvm-navy};
+  --cvm-navy-dark:  #{$cvm-navy-dark};
+  --cvm-gold:       #{$cvm-gold};
+  --cvm-gold-light: #{$cvm-gold-light};
+  --cvm-bg:         #{$cvm-bg};
+  --cvm-white:      #{$cvm-white};
+  --cvm-text:       #{$cvm-text};
+  --cvm-muted:      #{$cvm-muted};
+  --cvm-border:     #{$cvm-border};
+  --cvm-success:    #{$cvm-success};
+  --cvm-warning:    #{$cvm-warning};
+  --cvm-alert:      #{$cvm-alert};
+  --cvm-shadow:     0 2px 8px rgba(0,0,0,0.08);
+  --cvm-shadow-lg:  0 4px 16px rgba(0,0,0,0.10);
 }
 
+// ── Base ─────────────────────────────────────────────────────────────────────
 body {
-  font-family: "Inter", "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: "Inter", "Source Sans Pro", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
   font-size: 15px;
   line-height: 1.6;
   color: $cvm-text;
@@ -78,12 +82,12 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-// Quarto dashboard chrome — navbar + card + tabs.
-// IMPORTANT — lesson learned the hard way: only touch color/border/shadow/
-// font/background here. NEVER set padding, display, height, flex, or grid
-// on .card, .card-body, .value-box, .tab-content, .page-layout-custom, or
-// .quarto-dashboard-content. Quarto's dashboard layout JS depends on those
-// properties being unmodified and breaks silently at runtime.
+// ── Navbar ───────────────────────────────────────────────────────────────────
+// IMPORTANT — only touch color/border/shadow/font/background here.
+// NEVER set padding, display, height, flex, or grid on .card, .card-body,
+// .value-box, .tab-content, .page-layout-custom, or .quarto-dashboard-content.
+// Quarto's dashboard layout JS depends on those properties being unmodified
+// and breaks silently at runtime.
 .quarto-dashboard .navbar {
   background: $cvm-navy !important;
   border: none;
@@ -101,14 +105,31 @@ body {
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.05em;
+    white-space: nowrap;
   }
   .nav-link.active {
     color: $cvm-white !important;
     border-bottom: 2px solid $cvm-white;
     font-weight: 600;
   }
+  .navbar-nav {
+    gap: 2px;
+  }
 }
 
+@media (max-width: 1200px) {
+  .quarto-dashboard .navbar .nav-link {
+    font-size: 12px !important;
+    padding: 8px 8px !important;
+  }
+}
+@media (max-width: 900px) {
+  .quarto-dashboard .navbar-nav {
+    flex-wrap: wrap !important;
+  }
+}
+
+// ── Cards ────────────────────────────────────────────────────────────────────
 .quarto-dashboard .card {
   background: $cvm-white;
   border: 1px solid $cvm-border;
@@ -124,7 +145,7 @@ body {
   letter-spacing: 0.01em;
 }
 
-// Tab bar — uppercase + navy
+// ── Tab bar ──────────────────────────────────────────────────────────────────
 .nav-tabs {
   border-bottom: 1px solid $cvm-border;
   .nav-link {
@@ -136,7 +157,10 @@ body {
     border: none;
     border-bottom: 3px solid transparent;
     background: transparent;
-    &:hover { color: $cvm-navy; border-bottom-color: $cvm-border; }
+    &:hover {
+      color: $cvm-navy;
+      border-bottom-color: $cvm-border;
+    }
     &.active {
       color: $cvm-navy;
       border-bottom-color: $cvm-gold;
@@ -146,7 +170,7 @@ body {
   }
 }
 
-// Nested tabset pills used inside the tag coverage sub-tabs
+// Nested tabset pills (tag coverage sub-tabs)
 .nav-pills .nav-link {
   color: $cvm-muted;
   font-size: 12px;
@@ -160,7 +184,8 @@ body {
   }
 }
 
-// Value boxes — color/typography only. No layout overrides.
+// ── Value boxes ──────────────────────────────────────────────────────────────
+// Color/typography only — no layout overrides.
 .quarto-dashboard .value-box {
   border-left: 4px solid $cvm-gold;
   border-radius: 8px;
@@ -181,7 +206,111 @@ body {
   }
 }
 
-// Banners (printed via htmltools::HTML in the templates)
+// ── Filter bar ───────────────────────────────────────────────────────────────
+.cvm-filter-bar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: $cvm-white;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  padding: 14px 24px 18px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  border-bottom: 2px solid $cvm-navy;
+  font-family: "Inter", "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+
+  .label {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: $cvm-navy;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+  }
+}
+
+.cvm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 18px;
+  border: 2px solid #C7CDD6;
+  border-left: 4px solid #C7CDD6;
+  border-radius: 22px;
+  background: #F5F7FA;
+  color: $cvm-muted;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  transition: background 140ms, color 140ms, border-color 140ms;
+
+  .chip-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    box-sizing: border-box;
+    background: transparent;
+    border: 2px solid #9AA5B1;
+  }
+
+  &:hover {
+    background: #E8ECF0;
+    border-color: #9AA5B1;
+    color: $cvm-text;
+  }
+  &.active {
+    background: $cvm-navy;
+    color: $cvm-white;
+    border-color: $cvm-navy;
+    border-left-color: var(--chip-color, $cvm-gold);
+    box-shadow: 0 2px 6px rgba(0, 63, 107, 0.25);
+
+    .chip-dot {
+      background: var(--chip-color, $cvm-white);
+      border-color: $cvm-white;
+    }
+  }
+  &:focus-visible {
+    outline: 2px solid $cvm-gold;
+    outline-offset: 2px;
+  }
+}
+
+.cvm-filter-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 14px;
+  a {
+    color: $cvm-gold;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    border-bottom: 1px dashed rgba(171,139,0,0.4);
+    &:hover {
+      color: $cvm-navy;
+      border-color: $cvm-navy;
+    }
+    &:focus-visible {
+      outline: 2px solid $cvm-gold;
+      outline-offset: 2px;
+    }
+  }
+}
+@media (max-width: 700px) {
+  .cvm-filter-actions { margin-left: 0; }
+}
+
+// ── Banners ──────────────────────────────────────────────────────────────────
 .cvm-banner {
   padding: 14px 20px;
   border-radius: 8px;
@@ -194,7 +323,71 @@ body {
   &.alert   { background: #FFEBEE; border-color: $cvm-alert;   color: #8E1A1A; }
 }
 
-// Tag-set coverage metric row (original styling)
+// ── CVM card system ──────────────────────────────────────────────────────────
+// White cards used across every tab content section.
+.cvm-card {
+  width: 100%;
+  display: block;
+  clear: both;
+  box-sizing: border-box;
+  background: $cvm-white;
+  border: 1px solid #EEF1F5;
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+  padding: 24px;
+  margin-bottom: 48px;
+  overflow: visible;
+  height: auto;
+
+  > :first-child { margin-top: 0; }
+  > :last-child  { margin-bottom: 0; }
+}
+
+.cvm-card-title {
+  font-family: "Inter", "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 16px;
+  font-weight: 600;
+  color: $cvm-navy;
+  margin: 0 0 6px 0;
+  letter-spacing: -0.005em;
+}
+
+.cvm-card-desc {
+  font-size: 13px;
+  color: $cvm-muted;
+  margin: 0 0 20px 0;
+  line-height: 1.5;
+}
+
+// ── Histogram grid ───────────────────────────────────────────────────────────
+// CRITICAL: grid-auto-rows must be auto (not a fixed px value) so cards can
+// grow to contain their plotly charts. The post-render byte patch in
+// layout_fixes.R also rewrites any 360px value that slips through.
+.cvm-histogram-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-auto-rows: auto;
+  gap: 16px;
+}
+.cvm-histogram-card {
+  min-height: 500px;
+  height: auto;
+  overflow: visible;
+}
+.cvm-histogram-card .js-plotly-plot,
+.cvm-histogram-card .plotly.html-widget {
+  min-height: 460px;
+  width: 100%;
+}
+
+@media (max-width: 1100px) {
+  .cvm-histogram-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 700px) {
+  .cvm-histogram-grid { grid-template-columns: 1fr; }
+}
+
+// ── Tag-set coverage metric row ──────────────────────────────────────────────
 .cvm-ts-row {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -207,22 +400,38 @@ body {
   border-left: 4px solid $cvm-gold;
   border-radius: 8px;
   padding: 16px 20px;
-  .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: $cvm-muted; font-weight: 600; margin-bottom: 4px; }
-  .value { font-size: 24px; font-weight: 700; color: $cvm-navy; line-height: 1.1; }
+  .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: $cvm-muted;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .value {
+    font-size: 24px;
+    font-weight: 700;
+    color: $cvm-navy;
+    line-height: 1.1;
+  }
 }
 
-// Uncovered tags collapsible (original styling)
+// ── Uncovered tags collapsible ───────────────────────────────────────────────
 details.cvm-uncovered {
   background: #FFF8E1;
   border: 1px solid #FFE082;
   border-radius: 8px;
   padding: 12px 16px;
   margin-top: 16px;
-  summary { cursor: pointer; font-weight: 500; color: #8A6D00; }
+  summary {
+    cursor: pointer;
+    font-weight: 500;
+    color: #8A6D00;
+  }
   ul { margin-top: 8px; color: $cvm-text; }
 }
 
-// Narrative pane (Course Insights tab)
+// ── Narrative pane (Course Insights tab) ─────────────────────────────────────
 .cvm-narrative {
   background: $cvm-white;
   border: 1px solid $cvm-border;
@@ -232,11 +441,14 @@ details.cvm-uncovered {
   margin: 0 auto 24px auto;
   box-shadow: var(--cvm-shadow);
   line-height: 1.75;
+  overflow-y: visible;
+  height: auto;
+  max-height: none;
   h2, h3 { color: $cvm-navy; }
   p { margin-bottom: 1em; }
 }
 
-// Flag cards (concerns + change narrative)
+// ── Flag cards ───────────────────────────────────────────────────────────────
 .cvm-flag {
   display: flex;
   align-items: flex-start;
@@ -249,7 +461,14 @@ details.cvm-uncovered {
   &.red   { border-color: $cvm-alert; }
   &.amber { border-color: $cvm-warning; }
   &.green { border-color: $cvm-success; }
-  .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; color: $cvm-muted; margin-bottom: 2px; }
+  .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 700;
+    color: $cvm-muted;
+    margin-bottom: 2px;
+  }
   .issue { font-weight: 600; color: $cvm-text; }
   .rec   { color: $cvm-muted; font-size: 14px; margin-top: 4px; }
   ul { margin: 4px 0 0 16px; }
@@ -270,7 +489,7 @@ details.cvm-uncovered {
   &:last-child { border-bottom: none; }
 }
 
-// Downloads tab
+// ── Downloads tab ────────────────────────────────────────────────────────────
 .cvm-downloads {
   display: grid;
   gap: 12px;
@@ -290,7 +509,7 @@ details.cvm-uncovered {
   .size { color: $cvm-muted; font-size: 12px; text-align: right; }
 }
 
-// DataTables restyling
+// ── DataTables restyling ─────────────────────────────────────────────────────
 table.dataTable {
   thead th {
     background: $cvm-navy !important;
@@ -307,10 +526,148 @@ table.dataTable {
   border: none !important;
 }
 
-// Kill any remaining default Bootstrap gray
+// ── Chart containers ─────────────────────────────────────────────────────────
+// Apply a minimum height floor to plotly / htmlwidget containers inside cards
+// so charts never collapse to zero. Do NOT set height:NNNpx — that re-creates
+// the clipping bug. min-height + overflow:visible is the correct pattern.
+.cvm-card .plotly.html-widget,
+.cvm-card .html-widget,
+.cvm-chart {
+  min-height: 380px;
+  box-sizing: border-box;
+  overflow: visible;
+}
+
+// ── Tab-pane hygiene ─────────────────────────────────────────────────────────
+// Tabs scroll vertically on long content so cards never clip under the navbar.
+// Overview is intentionally excluded — do not touch it.
+.tab-pane#assessment-performance,
+.tab-pane#curriculum-tag-coverage,
+.tab-pane#cross-year-comparison,
+.tab-pane#survey-trends,
+.tab-pane#course-insights,
+.tab-pane#downloads {
+  overflow-y: auto !important;
+  height: auto !important;
+}
+
+// ── Feedback widget ──────────────────────────────────────────────────────────
+.cvm-feedback-button {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  background: $cvm-navy;
+  color: $cvm-white;
+  border: none;
+  border-radius: 999px;
+  padding: 12px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+  font-family: "Inter", "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+  &:hover { background: $cvm-navy-dark; }
+  &:focus-visible { outline: 2px solid $cvm-gold; outline-offset: 2px; }
+}
+
+.cvm-feedback-panel {
+  position: fixed;
+  bottom: 80px;
+  right: 24px;
+  z-index: 9999;
+  width: 340px;
+  max-width: calc(100vw - 48px);
+  background: $cvm-white;
+  border: 1px solid $cvm-border;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+  padding: 18px 20px;
+  font-family: "Inter", "Source Sans Pro", -apple-system, BlinkMacSystemFont, sans-serif;
+  display: none;
+  &.open { display: block; }
+  h3 { margin: 0 0 12px 0; font-size: 15px; font-weight: 700; color: $cvm-navy; }
+  label {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: $cvm-muted;
+    font-weight: 600;
+    margin-bottom: 4px;
+    margin-top: 10px;
+  }
+  select, textarea {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid #C7CDD6;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-family: inherit;
+    color: $cvm-text;
+    background: $cvm-white;
+  }
+  textarea {
+    resize: vertical;
+    min-height: 80px;
+  }
+  select:focus, textarea:focus {
+    outline: 2px solid $cvm-navy;
+    outline-offset: 1px;
+    border-color: $cvm-navy;
+  }
+  .cvm-fb-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 14px;
+    gap: 10px;
+  }
+  .cvm-fb-submit {
+    background: $cvm-navy;
+    color: $cvm-white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    &:hover { background: $cvm-navy-dark; }
+    &:disabled { background: #9AA5B1; cursor: not-allowed; }
+  }
+  .cvm-fb-cancel {
+    background: transparent;
+    color: $cvm-muted;
+    border: none;
+    font-size: 12px;
+    cursor: pointer;
+  }
+}
+
+.cvm-feedback-status {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  &.ok   { color: $cvm-success; }
+  &.err  { color: $cvm-alert; }
+  &.info { color: $cvm-muted; }
+}
+
+// ── Print mode ───────────────────────────────────────────────────────────────
+@media print {
+  .cvm-filter-bar, .cvm-feedback-button, .cvm-feedback-panel,
+  .quarto-dashboard .navbar { display: none !important; }
+  .cvm-card { break-inside: avoid; }
+  .cvm-narrative { display: block !important; }
+}
+
+// ── Misc Bootstrap kill ──────────────────────────────────────────────────────
 .well { background: $cvm-white; border: 1px solid $cvm-border; }
 
-/* ── Spacing fixes ─────────────────────────────────────────── */
+// ── Spacing and typography overrides ────────────────────────────────────────
+body { font-size: 15px !important; line-height: 1.6 !important; }
 .cvm-narrative p { margin-bottom: 20px !important; line-height: 1.7 !important; }
 .dataTable td { padding: 10px 14px !important; line-height: 1.5 !important; }
 .dataTable th { padding: 10px 14px !important; }

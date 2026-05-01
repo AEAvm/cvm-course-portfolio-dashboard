@@ -108,6 +108,33 @@ run_course_pipeline <- function(pool,
   )
   gradebook_ok <- !is.null(grades_df) && is.data.frame(grades_df) && nrow(grades_df) > 0
 
+  # ---- Cap grades at 100 for display statistics --------------------------
+  # cvm.gradebook surfaces a `weighted_overall_grade` row whose extra-credit
+  # weighting can push individual values above 100% (Class of 2023 / VETM
+  # 801 was the canonical case — observed values up to 185.7%). The raw
+  # values are correct as-stored but mis-leading on summary cards. Cap a
+  # parallel `grade_display` column at 100 so KPI medians, cohort summary
+  # rows, and threshold counts all show a sensible 0–100 range; the
+  # distribution histograms keep the un-capped `grade` so the underlying
+  # shape (including the long upper tail) stays visible.
+  had_grade_capping <- FALSE
+  if (gradebook_ok) {
+    n_above <- sum(grades_df$grade > 100, na.rm = TRUE)
+    if (n_above > 0) {
+      had_grade_capping <- TRUE
+      warning(sprintf(
+        "Course %s %s: %d grade values above 100 detected (extra-credit scale) — capping at 100 for display statistics only",
+        course_id, cohort_label, n_above
+      ))
+      log_render_step(sprintf(
+        "grade-cap: course=%s cohort=%s n_above=%d max_raw=%.2f",
+        course_id, cohort_label, n_above,
+        suppressWarnings(max(grades_df$grade, na.rm = TRUE))
+      ), "WARN")
+    }
+    grades_df$grade_display <- pmin(grades_df$grade, 100)
+  }
+
   # Assessment plots: route multi-component courses (VETM 804 A/B/C/D) to the
   # aggregated variant as the spec requires.
   plot_fn <- if (is_multi_component_course(course_name)) {
@@ -242,6 +269,7 @@ run_course_pipeline <- function(pool,
     grades_by_period = grades_by_period,
     grades_df        = grades_df,
     gradebook_ok     = gradebook_ok,
+    had_grade_capping = had_grade_capping,
     gradebook_messages = grades_messages,
     assessment_plots = assessment_plots,
     data_list        = data_list,
@@ -309,9 +337,39 @@ median_trend <- function(grades_df) {
 # KPI hero computation
 # -----------------------------------------------------------------------------
 summarize_kpis <- function(grades_df, tag_coverage, n_periods, cohort_label) {
-  overall_median <- if (!is.null(grades_df) && nrow(grades_df) > 0) {
-    stats::median(grades_df$grade, na.rm = TRUE)
-  } else NA_real_
+  # Compute median + IQR (Q1, Q3) from the capped display column so the
+  # downstream cards/tables/narrative all share one source of truth and
+  # extra-credit-inflated raw grades never leak into summary stats.
+  if (!is.null(grades_df) && nrow(grades_df) > 0) {
+    g_col <- if ("grade_display" %in% names(grades_df)) {
+      grades_df$grade_display
+    } else grades_df$grade
+    # For pct_80 we want the per-STUDENT final grade, not every gradebook
+    # row, so we restrict to the weighted-overall assessments where
+    # available (one row per student per period). Falls back to all rows
+    # if the weighted-overall rows aren't present, matching the legacy
+    # cohort_stats logic.
+    final_mask <- if ("assessment" %in% names(grades_df)) {
+      grades_df$assessment %in% c("weighted_overall_grade",
+                                  "individual_weighted_overall")
+    } else logical(nrow(grades_df))
+    final_g <- if (any(final_mask)) g_col[final_mask] else g_col
+    final_g <- final_g[is.finite(final_g)]
+    grades_display <- g_col[is.finite(g_col)]
+    if (length(grades_display) > 0) {
+      overall_median <- stats::median(grades_display, na.rm = TRUE)
+      q1  <- as.numeric(stats::quantile(grades_display, 0.25, na.rm = TRUE))
+      q3  <- as.numeric(stats::quantile(grades_display, 0.75, na.rm = TRUE))
+      iqr <- q3 - q1
+      pct_80 <- if (length(final_g) > 0) 100 * mean(final_g >= 80) else NA_real_
+    } else {
+      overall_median <- NA_real_; q1 <- NA_real_; q3 <- NA_real_; iqr <- NA_real_
+      pct_80 <- NA_real_
+    }
+  } else {
+    overall_median <- NA_real_; q1 <- NA_real_; q3 <- NA_real_; iqr <- NA_real_
+    pct_80 <- NA_real_
+  }
 
   total_students <- if (!is.null(grades_df) && nrow(grades_df) > 0) {
     dplyr::n_distinct(grades_df$id)
@@ -332,6 +390,10 @@ summarize_kpis <- function(grades_df, tag_coverage, n_periods, cohort_label) {
 
   list(
     overall_median     = overall_median,
+    q1                 = q1,
+    q3                 = q3,
+    iqr                = iqr,
+    pct_80             = pct_80,
     total_students     = total_students,
     periods_covered    = n_periods,
     n_tag_sets         = n_tag_sets,
