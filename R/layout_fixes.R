@@ -252,6 +252,29 @@ div[style*="minmax(420px"] {
 .cvm-filterable { transition: none !important; }
 .cvm-filterable[style*="display: none"] { margin: 0 !important; padding: 0 !important; }
 .tab-pane > * { height: auto !important; }
+
+/* ── Tag-set section headings (Curriculum coverage cards) ───────────── */
+[id^="tagset-"] .cvm-card-title {
+  font-size: 22px !important;
+  font-weight: 800 !important;
+  color: #003F6B !important;
+  border-bottom: 3px solid #C9A84C !important;
+  padding-bottom: 12px !important;
+  margin-bottom: 20px !important;
+  display: block !important;
+  width: 100% !important;
+}
+
+/* ── Sidebar tag-set anchors ────────────────────────────────────────── */
+.cvm-sidebar a { color: #C9A84C !important; text-decoration: none !important; }
+.cvm-sidebar a:hover { color: #FFFFFF !important; text-decoration: underline !important; }
+
+/* Downloads tab hidden — re-enable when PDFs are added by Yashvi */
+.quarto-dashboard .navbar-nav .nav-link[data-bs-target*="downloads"],
+.quarto-dashboard .navbar-nav .nav-link[href*="downloads"],
+.quarto-dashboard .navbar-nav .nav-item:has(a[href*="downloads"]) {
+  display: none !important;
+}
 </style>'
 
   # Inject before </head>

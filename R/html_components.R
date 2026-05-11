@@ -304,6 +304,7 @@ ui_sidebar <- function(course_code,
   }
 
   tags$div(
+    class = "cvm-sidebar",
     style = .css(
       "background:", .CVM$navy, ";",
       "color:", .CVM$white, ";",

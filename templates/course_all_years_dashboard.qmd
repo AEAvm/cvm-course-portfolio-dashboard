@@ -288,7 +288,20 @@ ui_sidebar(
     list(title = "Classes included",
          items = vapply(all_data, function(r) r$cohort_label, character(1))),
     list(title = "Tag sets available",
-         items = tag_set_pretty)
+         items = lapply(seq_along(tag_set_names), function(i) {
+           ts <- tag_set_names[[i]]
+           pretty <- tag_set_pretty[[i]]
+           anchor_id <- paste0("tagset-", tolower(gsub("[^A-Za-z0-9]", "-", ts)))
+           tags$a(
+             href = paste0("#", anchor_id),
+             style = "color:#C9A84C; text-decoration:none; cursor:pointer;",
+             onclick = sprintf(
+               "event.preventDefault(); document.getElementById('%s').scrollIntoView({behavior:'smooth', block:'start'}); return false;",
+               anchor_id
+             ),
+             pretty
+           )
+         }))
   )
 )
 ```
@@ -373,8 +386,6 @@ rows <- lapply(names(all_data), function(lab) {
   )
 })
 summary_df <- do.call(rbind, rows)
-any_capped <- any(vapply(all_data, function(r) isTRUE(r$had_grade_capping),
-                         logical(1)))
 # Cohort cell = colored dot + label. The containing <tr> is NOT wrapped in
 # .cvm-filterable (DT rebuilds rows dynamically, and hiding rows via the
 # filter JS would break DT's rendering). The chip filter bar drives the OTHER
@@ -396,6 +407,70 @@ summary_df <- summary_df[, c("Cohort", "Median", "IQR (Q1–Q3)",
                              "% ≥ 90", "% ≥ 80", "% < 70",
                              "N", "Periods", "Tag Sets"), drop = FALSE]
 
+# Pooled-stats row: same final-grade subset each cohort used, concatenated
+# across all cohorts. Appended as one extra row at the bottom of the table
+# with a navy-on-white visual treatment via DT rowCallback.
+pooled_final <- unlist(lapply(all_data, function(r) {
+  if (!isTRUE(r$gradebook_ok) || is.null(r$grades_df) || nrow(r$grades_df) == 0) {
+    return(numeric(0))
+  }
+  final <- r$grades_df |>
+    dplyr::filter(.data$assessment %in% c("weighted_overall_grade",
+                                          "individual_weighted_overall"))
+  df <- if (nrow(final) > 0) final else r$grades_df
+  g_col <- if ("grade_display" %in% names(df)) df$grade_display else pmin(df$grade, 100)
+  g_col[!is.na(g_col) & is.finite(g_col)]
+}), use.names = FALSE)
+
+if (length(pooled_final) > 0) {
+  pooled_median  <- sprintf("%.1f", stats::median(pooled_final, na.rm = TRUE))
+  pooled_q1      <- as.numeric(stats::quantile(pooled_final, 0.25, na.rm = TRUE))
+  pooled_q3      <- as.numeric(stats::quantile(pooled_final, 0.75, na.rm = TRUE))
+  pooled_iqr     <- sprintf("%.1f – %.1f", pooled_q1, pooled_q3)
+  pooled_mean    <- round(mean(pooled_final, na.rm = TRUE), 1)
+  pooled_sd      <- round(stats::sd(pooled_final, na.rm = TRUE), 1)
+  pooled_pct90   <- round(100 * mean(pooled_final >= 90, na.rm = TRUE), 1)
+  pooled_pct80   <- round(100 * mean(pooled_final >= 80, na.rm = TRUE), 1)
+  pooled_pct70   <- round(100 * mean(pooled_final <  70, na.rm = TRUE), 1)
+} else {
+  pooled_median <- "—"
+  pooled_iqr    <- "—"
+  pooled_mean   <- NA_real_
+  pooled_sd     <- NA_real_
+  pooled_pct90  <- NA_real_
+  pooled_pct80  <- NA_real_
+  pooled_pct70  <- NA_real_
+}
+pooled_n       <- as.integer(sum(summary_df$N, na.rm = TRUE))
+pooled_periods <- as.integer(sum(summary_df$Periods, na.rm = TRUE))
+pooled_tagsets <- as.integer(max(summary_df$`Tag Sets`, na.rm = TRUE))
+
+# Plain-text Cohort cell so the rowCallback below can match it by string;
+# the navy/white/700 styling is supplied entirely by the rowCallback (no
+# <strong> wrapper needed and none of the per-cohort dot prefix).
+pooled_row <- data.frame(
+  Cohort         = "All Cohorts (Pooled)",
+  Median         = pooled_median,
+  `IQR (Q1–Q3)`  = pooled_iqr,
+  Mean           = pooled_mean,
+  SD             = pooled_sd,
+  `% ≥ 90`       = pooled_pct90,
+  `% ≥ 80`       = pooled_pct80,
+  `% < 70`       = pooled_pct70,
+  N              = pooled_n,
+  Periods        = pooled_periods,
+  `Tag Sets`     = pooled_tagsets,
+  check.names    = FALSE,
+  stringsAsFactors = FALSE
+)
+summary_df <- rbind(summary_df, pooled_row)
+
+# Always show all rows — cohorts + pooled row — no pagination ever.
+# Future-proofs the table as new graduating classes are added: even if
+# Class of 2029/2030/... appear, every row renders inline and the
+# capping footnote always sits cleanly below the last row.
+n_table_rows <- nrow(summary_df)  # includes the pooled row
+
 # Median and IQR (Q1–Q3) are character columns; everything else stays
 # numeric and goes through DT::formatRound for 1-decimal display.
 numeric_cols <- c("Mean", "SD", "% ≥ 90", "% ≥ 80", "% < 70",
@@ -409,11 +484,27 @@ dt_widget <- DT::datatable(
   escape   = FALSE,
   extensions = "Buttons",
   options  = list(
-    dom = "Bfrtip", pageLength = 20, ordering = FALSE, scrollX = FALSE,
-    buttons = cvm_dt_buttons("cohort_summary"),
+    dom            = "Bfrtip",
+    pageLength     = n_table_rows,
+    lengthMenu     = list(c(n_table_rows, -1),
+                          c(as.character(n_table_rows), "All")),
+    paging         = FALSE,
+    scrollCollapse = FALSE,
+    ordering       = FALSE,
+    scrollX        = FALSE,
+    autoWidth      = TRUE,
+    buttons        = cvm_dt_buttons("cohort_summary"),
     columnDefs = list(
-      list(targets = 0, className = "dt-left"),
+      list(targets = 0, className = "dt-left", width = "140px"),
       list(targets = right_align_idx0, className = "dt-right")
+    ),
+    rowCallback = DT::JS(
+      "function(row, data, index) {",
+      "  if (data[0] === 'All Cohorts (Pooled)') {",
+      "    $(row).css({'background-color':'#003F6B','color':'#FFFFFF','font-weight':'700'});",
+      "    $('td', row).css({'background-color':'#003F6B','color':'#FFFFFF','border-top':'2px solid #AB8B00'});",
+      "  }",
+      "}"
     ),
     initComplete = DT::JS(
       "function(settings, json) {",
@@ -431,23 +522,6 @@ dt_widget <- DT::datatable(
                               "% ≥ 90", "% ≥ 80", "% < 70"), digits = 1)
 
 dt_widget
-```
-
-```{r}
-#| title: "Notes"
-# Overview-only footer. Single capping disclaimer lives here so the table
-# itself stays clean. Renders nothing when no cohort triggered the cap.
-if (isTRUE(any_capped)) {
-  htmltools::tags$p(
-    style = "font-size:12px;color:#5A6472;margin:8px 0 0 0;font-style:italic;",
-    "Grades are capped at 100 for display. Original weighted formula included extra credit above 100% in some cohorts; capping affects display statistics only and not the underlying data."
-  )
-} else {
-  htmltools::tags$p(
-    style = "display:none;",
-    ""
-  )
-}
 ```
 
 # Assessment Performance
@@ -774,6 +848,62 @@ tagList(
 # output: asis and no print() inside an asis block — widgets go through
 # htmltools' knit_print which correctly registers plotly dependencies.
 
+# Truncate long tag labels for chart display. Compresses well-known
+# multi-line AVMA / EPA / PIG descriptors first, then hard-truncates
+# anything still over max_chars. Vectorized over `label`.
+truncate_tag_label <- function(label, max_chars = 45) {
+  label <- as.character(label)
+  label <- stringr::str_squish(label)
+
+  # AVMA
+  label <- gsub("Emergency and intensive care case management.*", "Emergency & ICU Case Management", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Basic medicine skills and case management.*", "Basic Medicine & Case Management", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Comprehensive patient diagnosis.*diagnostic testing.*record management.*", "Patient Diagnosis & Diagnostic Testing", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Comprehensive treatment planning.*referral.*", "Treatment Planning & Referral", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Basic surgery skills and case management.*", "Basic Surgery & Case Management", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Anesthesia and pain management.*welfare.*", "Anesthesia, Pain Management & Welfare", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Ethical and professional conduct.*communication.*diversity.*", "Ethics, Professionalism & Communication", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Understanding of health promotion.*biosecurity.*zoonoses.*food safety.*", "Health Promotion, Biosecurity & Zoonoses", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Critical Analysis of new information.*veterinary medicine.*", "Critical Analysis & Research", label, ignore.case = TRUE, perl = TRUE)
+
+  # EPAs
+  label <- gsub("Develop and implement a management/treatment plan.*", "Management & Treatment Plan", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Recognize a patient requiring urgent or emergent care.*evaluation and management.*", "Urgent/Emergent Care & Management", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Formulate recommendations for preventive healthcare.*", "Preventive Healthcare", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub(".*zoonotic disease.*mitigate potential risks.*public health.*standard operating.*", "Zoonotic Risk & Public Health Protocols", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("aggression\\) and medical.*zoonotic.*public health.*hospital protocols.*", "Zoonotic Risk & Public Health Protocols", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Perform general anesthesia and recovery.*monitoring and support.*", "General Anesthesia & Recovery", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Perform a common surgical procedure.*pre-operative.*post-operative.*", "Surgical Procedure & Perioperative Care", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Formulate relevant questions and retrieve evidence.*", "Evidence-Based Practice", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Develop a diagnostic plan and interpret results.*", "Diagnostic Plan & Result Interpretation", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Gather a history, perform an examination.*differential diagnosis.*", "History, Exam & Differential Diagnosis", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Business acumen.*", "Business Acumen", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Ethical considerations.*Time management.*Self directed.*Career Planning.*", "Ethics, Time Management & Career Planning", label, ignore.case = TRUE, perl = TRUE)
+
+  # PIGs
+  label <- gsub("discuss an appropriate Diagnostic Plan and Treatment.*", "Diagnostic Plan & Treatment/Management", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("appropriate for patient that is updated.*", "", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("in all aspects of veterinary medicine", "", label, ignore.case = TRUE)
+  label <- gsub("with consideration of client obj.*", "", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("as new information develops", "", label, ignore.case = TRUE)
+  label <- gsub("in professional and personal life", "", label, ignore.case = TRUE)
+  label <- gsub("including food safety", "", label, ignore.case = TRUE)
+  label <- gsub("Establishes and develops their role within.*team approach.*", "Veterinary Health Care Team & Collaboration", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Analyzes and develops Preventive Care Plans.*herd health.*", "Preventive Care & Herd Health", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Recognize, discuss and address Zoonotic.*", "Zoonotic & Public Health", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Can apply Diversity and Inclusion.*", "Diversity, Inclusion & Communication", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Applies sound reasoning in Career.*", "Career & Personal Development", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Makes sound decisions about financial.*", "Financial & Business Decisions", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Can perform Sedation, Local Anesthesia.*", "Sedation & General Anesthesia", label, ignore.case = TRUE, perl = TRUE)
+  label <- gsub("Analyzes options for Pain Management.*", "Pain Management", label, ignore.case = TRUE, perl = TRUE)
+
+  # General cleanup
+  label <- stringr::str_squish(label)
+  ifelse(nchar(label) > max_chars,
+         paste0(substr(label, 1, max_chars - 3), "..."),
+         label)
+}
+
 if (length(tag_set_names) == 0) {
   ui_banner("No tag coverage data available for this course.", variant = "info")
 } else {
@@ -921,9 +1051,19 @@ if (length(tag_set_names) == 0) {
     # Package-style plot: dodged vertical bars, rotated x labels — matches
     # the look of cvm.course.portfolio::generate_tagset_plots() shipped in
     # the PPT export. Converted to plotly for interactivity.
+    # Truncate long tag labels for chart readability — pure display
+    # transform on the count vectors' names before they reach plotly.
+    cohort_counts_display <- lapply(cohort_counts, function(cc) {
+      if (is.null(cc) || length(cc) == 0) return(cc)
+      stats::setNames(cc, truncate_tag_label(names(cc)))
+    })
     bar <- tag_pkg_style_plotly_multi(
-      cohort_counts, cohort_colors, title = pretty,
+      cohort_counts_display, cohort_colors, title = pretty,
       height = max(600, 100 + 28 * length(all_tags_any))
+    )
+    bar$plot <- bar$plot |> plotly::layout(
+      margin = list(l = 340, r = 40, t = 60, b = 60),
+      yaxis = list(tickfont = list(size = 11), automargin = TRUE)
     )
 
     # Heatmap — rebuilt as htmltools grid (see render_tag_heatmap above).
@@ -968,17 +1108,22 @@ if (length(tag_set_names) == 0) {
     # titled with `.cvm-card-title` (navy 16px/600).
     tags$div(
       class = "cvm-card",
+      id = paste0("tagset-", tolower(gsub("[^A-Za-z0-9]", "-", ts))),
       style = paste0(
         "width:100%;display:block;clear:both;",
         "margin-bottom:48px;padding:24px;",
         "background:#FFFFFF;border:1px solid #EEF1F5;border-left:4px solid #AB8B00;",
-        "border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+        "border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.07);scroll-margin-top:20px;"
       ),
       # Card header: tag-set title + muted subtitle + gold pill.
       tags$div(
         style = "display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px;",
         tags$div(
-          tags$h2(class = "cvm-card-title", pretty),
+          tags$h2(
+            class = "cvm-card-title",
+            style = "font-size:22px; font-weight:800; color:#003F6B; border-bottom:3px solid #C9A84C; padding-bottom:12px; margin-bottom:20px;",
+            pretty
+          ),
           tags$p(class = "cvm-card-desc",
                  sprintf("%d covered across all cohorts · %d total in taxonomy",
                          n_any_cov, n_total_tags))
@@ -989,8 +1134,39 @@ if (length(tag_set_names) == 0) {
           " tags"
         )
       ),
-      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:8px;", "Coverage by cohort"),
-      lapply(names(all_data), coverage_row),
+      tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:8px;", "Disciplines covered by graduating class"),
+      tags$div(
+        style = "display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:12px; margin-top:16px;",
+        lapply(names(all_data), function(lab) {
+          col <- cohort_color_for(lab)
+          r <- all_data[[lab]]
+          merged <- if (!is.null(r$tag_coverage) && length(r$tag_coverage) > 0) {
+            dplyr::bind_rows(Filter(Negate(is.null),
+                                    lapply(r$tag_coverage, function(x) x[[ts]])))
+          } else tibble::tibble()
+          s <- tag_coverage_summary(merged)
+          covered <- as.integer(s$covered %||% 0L)
+          total   <- as.integer(s$total   %||% 0L)
+          pct     <- if (is.na(s$pct)) 0 else as.numeric(s$pct)
+          tags$div(
+            class = "cvm-filterable",
+            `data-cohort-labels` = lab,
+            style = sprintf(
+              "background:#FFFFFF; border:1px solid #E0E4EC; border-top:4px solid %s; border-radius:10px; padding:16px; text-align:center;",
+              col
+            ),
+            tags$div(style = sprintf("width:12px;height:12px;border-radius:50%%;background:%s;display:inline-block;margin-bottom:8px;", col)),
+            tags$div(style = sprintf("font-weight:700; color:%s; font-size:13px; margin-bottom:6px;", col), lab),
+            tags$div(style = "font-size:22px; font-weight:800; color:#003F6B; line-height:1;", sprintf("%d/%d", covered, total)),
+            tags$div(style = "font-size:11px; color:#5A6472; margin-top:4px;", "tags covered"),
+            tags$div(style = sprintf("font-size:18px; font-weight:700; color:%s; margin-top:8px;", col), sprintf("%.1f%%", pct)),
+            tags$div(
+              style = "background:#F0F0F0; border-radius:4px; height:5px; width:100%; margin-top:8px;",
+              tags$div(style = sprintf("background:%s; border-radius:4px; height:5px; width:%.1f%%;", col, min(pct, 100)))
+            )
+          )
+        })
+      ),
       tags$h3(class = "cvm-card-title", style = "font-size:14px;margin-top:24px;", "Tag coverage by component"),
       tags$button(
         onclick = sprintf(
@@ -1878,6 +2054,11 @@ if (is.null(narrative)) {
 }
 ```
 
+<!--
+HIDDEN — Downloads tab is hidden via CSS in R/layout_fixes.R
+Re-enable by removing the CSS block tagged "Downloads tab hidden"
+when Yashvi has added the survey PDFs to the outputs folders.
+-->
 # Downloads
 
 ```{r}
