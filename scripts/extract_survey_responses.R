@@ -58,7 +58,30 @@ courses <- courses |>
 # Add a new row to cohort_map each year when a new class starts.
 # =============================================================================
 
-source(here::here("scripts", "elentra_data_retrieval.R"))
+# `elentra_data_retrieval.R` is structured as a standalone "full run"
+# script: function definitions are interleaved with top-level code that
+# pulls every report type and then library(gridExtra)s. Sourcing it would
+# execute that entire pipeline (and crash on missing gridExtra). Instead
+# we parse the file and evaluate ONLY top-level function assignments —
+# i.e. `name <- function(...) {...}` — into the global env. Functions
+# inside that script use namespaced calls (vmh::, DBI::, tibble::) so
+# they work fine without the script's own library() bootstrap.
+load_helper_funcs <- function(path) {
+  exprs <- parse(path, keep.source = FALSE)
+  is_func_assign <- function(e) {
+    if (!is.call(e) || length(e) < 3) return(FALSE)
+    op <- tryCatch(as.character(e[[1]]), error = function(e) "")
+    if (!op %in% c("<-", "=", "<<-")) return(FALSE)
+    rhs <- e[[3]]
+    if (!is.call(rhs)) return(FALSE)
+    rhs_op <- tryCatch(as.character(rhs[[1]]), error = function(e) "")
+    identical(rhs_op, "function")
+  }
+  for (e in as.list(exprs)) {
+    if (is_func_assign(e)) eval(e, envir = globalenv())
+  }
+}
+load_helper_funcs(here::here("scripts", "elentra_data_retrieval.R"))
 
 library(dplyr)
 library(tibble)

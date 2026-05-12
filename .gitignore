@@ -27,6 +27,9 @@ logs/
 # Surveys and generated PDFs
 */surveys/
 
+# Elentra retrieval side-output (full-run dumps with student PII)
+elentra_output/
+
 # OS
 .DS_Store
 Thumbs.db
