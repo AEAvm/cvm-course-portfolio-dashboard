@@ -331,6 +331,50 @@ analyse_survey_trends <- function(all_data, cohort_colors) {
         )
       }
     }
+
+    # Narrative key sentences — extracted unconditionally as a parallel
+    # `key_findings` record so the per-cohort card in the QMD can use it
+    # as a fallback whenever parse_likert_rows() returns NULL (narrative-
+    # format PDFs that have no Likert table). The Likert-keyword scan
+    # above produces loose pseudo-matches for narrative PDFs, so gating
+    # on `length(questions) == 0` would never open. The QMD's order of
+    # preference (Likert table → narrative bullets → CSV-fallback) makes
+    # this safe even when both Likert and narrative records coexist.
+    {
+      key_terms <- c("student", "course", "recommend", "improve",
+                     "effective", "challeng", "helpful", "feedback",
+                     "learning", "assessment", "faculty", "content",
+                     "outcome", "lecture", "prework", "team", "tbl",
+                     "satisf", "overall", "quality", "instructor")
+
+      # Split on sentence-ending punctuation OR newlines
+      sentences <- unlist(strsplit(text, "[.!?\n]{1,}"))
+      sentences <- stringr::str_squish(sentences)
+
+      # Permissive length filter
+      sentences <- sentences[nchar(sentences) > 15 & nchar(sentences) < 500]
+
+      # Match any key term (partial match)
+      relevant <- sentences[vapply(sentences, function(s) {
+        any(vapply(key_terms,
+                   function(t) grepl(t, s, ignore.case = TRUE),
+                   logical(1)))
+      }, logical(1))]
+
+      relevant <- unique(relevant)
+      relevant <- head(relevant, 10)
+
+      if (length(relevant) > 0) {
+        questions[["key_findings"]] <- list(
+          keyword   = "key_findings",
+          cohort    = cohort_label,
+          sentences = relevant,
+          agreement = NA_real_,
+          type      = "narrative"
+        )
+      }
+    }
+
     questions
   }
 

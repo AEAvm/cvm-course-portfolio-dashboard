@@ -1186,6 +1186,103 @@ if (length(tag_set_names) == 0) {
 }
 ```
 
+## Cross-Year Tag Signals
+
+```{r}
+#| title: "Cross-year tag signals"
+# Tag-coverage signal stats — moved here from the Cross-Year Comparison tab
+# so all tag-coverage analytics live under one heading. Renders the
+# top 5 most consistently covered tags and the top 5 most variable tags
+# (potential curriculum gaps) side-by-side. Requires ≥ 2 cohorts of data.
+
+if (length(all_data) < 2 || length(tag_set_names) == 0) {
+  ui_banner(
+    "Cross-year tag signals require at least two cohorts with tag coverage data.",
+    variant = "info"
+  )
+} else {
+  cohort_counts_by_ts <- stats::setNames(
+    lapply(tag_set_names, function(ts) {
+      stats::setNames(
+        lapply(all_data, function(r) {
+          if (is.null(r$tag_coverage) || length(r$tag_coverage) == 0) return(integer(0))
+          merged <- dplyr::bind_rows(Filter(Negate(is.null),
+                                            lapply(r$tag_coverage, function(x) x[[ts]])))
+          tagset_counts_vec(merged)
+        }),
+        names(all_data)
+      )
+    }),
+    tag_set_names
+  )
+  tag_stats <- compute_tag_stats(cohort_counts_by_ts)
+  top_c <- top_consistent_tags(tag_stats, 5)
+  top_v <- top_variable_tags(tag_stats, 5)
+
+  # Inner mini-cards — soft background + accent rule; sit inside the
+  # parent .cvm-card so they intentionally have no drop shadow.
+  tag_card <- function(title, df, metric_col, metric_label, accent) {
+    tags$div(
+      style = sprintf(
+        "background:#F9FAFB;border-left:4px solid %s;border-radius:8px;padding:18px 20px;",
+        accent
+      ),
+      tags$div(
+        style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;font-weight:600;margin-bottom:10px;",
+        title
+      ),
+      if (nrow(df) == 0) {
+        tags$p(style = "color:#5A6472;font-size:13px;margin:0;",
+               "Not enough tag variation across cohorts to rank.")
+      } else {
+        tags$ol(
+          style = "margin:0;padding-left:20px;",
+          lapply(seq_len(nrow(df)), function(i) {
+            row <- df[i, ]
+            tags$li(
+              style = "padding:4px 0;font-size:13px;color:#1A1A2E;",
+              tags$strong(row$tag),
+              tags$span(
+                style = "color:#5A6472;font-size:11px;margin-left:6px;",
+                sprintf("(%s · %s %s)",
+                        pretty_tagset_name(row$tagset),
+                        metric_label,
+                        if (is.numeric(row[[metric_col]])) sprintf("%.1f", row[[metric_col]])
+                        else as.character(row[[metric_col]]))
+              )
+            )
+          })
+        )
+      }
+    )
+  }
+  tag_cards_ui <- tags$div(
+    style = "display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:8px;",
+    tag_card("Top 5 most consistently covered tags",
+             top_c, "min", "min count",
+             CVM_PALETTE$success),
+    tag_card("Top 5 most variable tags (possible gaps)",
+             top_v, "sd", "SD",
+             CVM_PALETTE$warning)
+  )
+
+  cyts_card_style <- paste0(
+    "width:100%;display:block;clear:both;",
+    "margin-bottom:48px;padding:24px;",
+    "background:#FFFFFF;border:1px solid #EEF1F5;border-radius:12px;",
+    "box-shadow:0 2px 8px rgba(0,0,0,0.07);"
+  )
+
+  tags$div(
+    class = "cvm-card", style = cyts_card_style,
+    tags$h2(class = "cvm-card-title", "Tag-coverage signals"),
+    tags$p(class = "cvm-card-desc",
+           "Which tags are covered every year vs. which shift cohort to cohort (potential curriculum gaps)."),
+    tag_cards_ui
+  )
+}
+```
+
 # Cross-Year Comparison
 
 ```{r}
@@ -1212,24 +1309,9 @@ if (length(all_data) < 2) {
   volume       <- compute_student_volume(all_data)
   assess_trend <- compute_assessment_trends(all_data, min_cohorts = 3)
 
-  # Re-derive cohort_counts_by_ts for tag stats.
-  cohort_counts_by_ts <- stats::setNames(
-    lapply(tag_set_names, function(ts) {
-      stats::setNames(
-        lapply(all_data, function(r) {
-          if (is.null(r$tag_coverage) || length(r$tag_coverage) == 0) return(integer(0))
-          merged <- dplyr::bind_rows(Filter(Negate(is.null),
-                                            lapply(r$tag_coverage, function(x) x[[ts]])))
-          tagset_counts_vec(merged)
-        }),
-        names(all_data)
-      )
-    }),
-    tag_set_names
-  )
-  tag_stats <- compute_tag_stats(cohort_counts_by_ts)
-  top_c <- top_consistent_tags(tag_stats, 5)
-  top_v <- top_variable_tags(tag_stats, 5)
+  # Tag-coverage signal stats (top consistent / variable tags) moved to the
+  # Curriculum Tag Coverage tab under "Cross-Year Tag Signals" — see the
+  # chunk titled "Cross-year tag signals" lower in this template.
 
   # ---------- 1. Grade trajectory ----------
   # Trajectory now reports `% ≥ 80` as the primary metric — directly
@@ -1345,143 +1427,149 @@ if (length(all_data) < 2) {
         tags$li("Measures how consistently the course delivers outcomes year over year"),
         tags$li(HTML("<strong>Low CV (&lt; 5%)</strong> = stable delivery — outcomes are consistent across cohorts")),
         tags$li(HTML("<strong>Medium CV (5–15%)</strong> = some variation — worth monitoring")),
-        tags$li(HTML("<strong>High CV (&gt; 15%)</strong> = significant year-to-year inconsistency — investigate curriculum or delivery changes")),
+        tags$li(HTML("<strong>High CV (&gt; 15%)</strong> = significant year-to-year variation — review curriculum or delivery changes")),
         tags$li(HTML("The <strong>% ≥ 80 range</strong> shows the actual spread: e.g. 93.9%–99.5% means in the best year 99.5% of students passed at 80%+, in the worst year 93.9% did"))
       )
     )
   )
 
   # ---------- 3. Student volume ----------
-  # Data labels on top of each bar per spec.
-  volume_bar <- plotly::plot_ly(
-    data = volume,
-    x = ~cohort, y = ~students, type = "bar",
-    marker = list(color = unname(cohort_colors[volume$cohort])),
-    text = ~students,
-    textposition = "outside",
-    textfont = list(color = "#1A1A2E", size = 12, family = "Inter"),
-    hovertemplate = "%{x}<br>%{y} students<extra></extra>",
-    height = 460
-  ) |>
-    plotly::layout(
-      title = list(text = "Students assessed per cohort",
-                   font = list(color = CVM_PALETTE$navy, size = 14)),
-      xaxis = list(title = "", tickangle = -20, type = "category", automargin = TRUE),
-      yaxis = list(title = "N students", gridcolor = "#E4E7EC",
-                   rangemode = "tozero",
-                   # Headroom for the data label on the tallest bar.
-                   range = c(0, max(volume$students, na.rm = TRUE) * 1.15)),
-      paper_bgcolor = "white", plot_bgcolor = "white",
-      font = list(color = CVM_PALETTE$text, family = "Inter, sans-serif"),
-      margin = list(t = 50, b = 80, l = 60, r = 40),
-      showlegend = FALSE, autosize = TRUE
-    )
-  volume_bar <- do.call(plotly::config,
-                        c(list(volume_bar),
-                          cvm_plotly_config_args(filename_tag = "student_volume")))
+  # Rendered as a compact DT table (Cohort | N Students | Periods) instead
+  # of a bar chart — the values are short and a table reads cleaner here.
+  volume_table_df <- data.frame(
+    Cohort       = volume$cohort,
+    `N Students` = as.integer(volume$students),
+    Periods      = vapply(volume$cohort, function(lab) {
+      r <- all_data[[lab]]
+      as.integer(r$kpi$periods_covered %||% 0L)
+    }, integer(1)),
+    check.names      = FALSE,
+    stringsAsFactors = FALSE
+  )
+  # Colored dot prefix on the Cohort cell so the table keeps the cohort
+  # color motif used elsewhere on the page. escape=FALSE on the DT below.
+  volume_table_df$Cohort <- vapply(volume_table_df$Cohort, function(lab) {
+    col <- cohort_color_for(lab)
+    sprintf('<span style="display:inline-block;width:10px;height:10px;border-radius:50%%;background:%s;margin-right:8px;vertical-align:middle;"></span>%s',
+            col, htmlEscape(lab))
+  }, character(1), USE.NAMES = FALSE)
 
-  # ---------- 4 + 5. Top consistent / variable tags ----------
-  # Inner mini-cards — soft background + accent rule; sit inside the
-  # parent .cvm-card so they intentionally have no drop shadow.
-  tag_card <- function(title, df, metric_col, metric_label, accent) {
-    tags$div(
-      style = sprintf(
-        "background:#F9FAFB;border-left:4px solid %s;border-radius:8px;padding:18px 20px;",
-        accent
+  volume_dt <- DT::datatable(
+    volume_table_df,
+    rownames = FALSE, escape = FALSE,
+    options  = list(
+      dom        = "t",
+      ordering   = FALSE,
+      pageLength = 20,
+      paging     = FALSE,
+      scrollX    = FALSE,
+      columnDefs = list(
+        list(targets = 0,   className = "dt-left"),
+        list(targets = 1:2, className = "dt-right")
       ),
-      tags$div(
-        style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;font-weight:600;margin-bottom:10px;",
-        title
-      ),
-      if (nrow(df) == 0) {
-        tags$p(style = "color:#5A6472;font-size:13px;margin:0;",
-               "Not enough tag variance across cohorts to rank.")
-      } else {
-        tags$ol(
-          style = "margin:0;padding-left:20px;",
-          lapply(seq_len(nrow(df)), function(i) {
-            row <- df[i, ]
-            tags$li(
-              style = "padding:4px 0;font-size:13px;color:#1A1A2E;",
-              tags$strong(row$tag),
-              tags$span(
-                style = "color:#5A6472;font-size:11px;margin-left:6px;",
-                sprintf("(%s · %s %s)",
-                        pretty_tagset_name(row$tagset),
-                        metric_label,
-                        if (is.numeric(row[[metric_col]])) sprintf("%.1f", row[[metric_col]])
-                        else as.character(row[[metric_col]]))
-              )
-            )
-          })
-        )
-      }
+      initComplete = DT::JS(
+        "function(settings, json) {",
+        "  $(this.api().table().header()).find('th').css({",
+        "    'background-color': '#003F6B',",
+        "    'color':            '#FFFFFF',",
+        "    'font-weight':      '600',",
+        "    'border-bottom':    '3px solid #AB8B00'",
+        "  });",
+        "}"
+      )
     )
-  }
-  # Fix 3: explicit two-column CSS grid (not auto-fit / not floated / not
-  # absolutely positioned) so the two tag-signal cards sit side-by-side
-  # without overlap.
-  tag_cards_ui <- tags$div(
-    style = "display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:8px;",
-    tag_card("Top 5 most consistently covered tags",
-             top_c, "min", "min count",
-             CVM_PALETTE$success),
-    tag_card("Top 5 most variable tags (possible gaps)",
-             top_v, "sd", "SD",
-             CVM_PALETTE$warning)
   )
 
   # ---------- 6. Assessment difficulty signal ----------
   assess_ui <- if (nrow(assess_trend) == 0) {
     ui_banner(paste("No assessment has data in 3+ cohorts yet — difficulty",
-                    "trends will become available as more cohorts finish."),
+                    "signals will become available as more cohorts finish."),
               variant = "info")
   } else {
-    df <- assess_trend
-    df$Flag <- vapply(df$flag, function(f) {
-      switch(f,
-             declining = "⚠ declining",
-             improving = "↑ improving",
-             stable    = "= stable",
-             f)
-    }, character(1))
-    dt <- DT::datatable(
-      df |>
-        dplyr::transmute(
-          Assessment  = .data$assessment,
-          `Cohorts`   = .data$n_cohorts,
-          `First mean`= .data$first_mean,
-          `Last mean` = .data$last_mean,
-          Δ           = .data$delta,
-          Flag        = .data$Flag
-        ),
-      rownames = FALSE, escape = FALSE,
-      extensions = "Buttons",
-      options  = list(
-        dom = "Bfrtip", pageLength = 15, scrollX = FALSE,
-        buttons = cvm_dt_buttons("assessment_trends"),
-        columnDefs = list(
-          list(targets = 0, className = "dt-left"),
-          list(targets = 1:5, className = "dt-right")
+    # Filter out rows whose assessment name is NA / blank / whitespace.
+    df <- assess_trend |>
+      dplyr::filter(!is.na(assessment) & stringr::str_squish(assessment) != "")
+
+    if (nrow(df) == 0) {
+      ui_banner(paste("No assessment has data in 3+ cohorts yet — difficulty",
+                      "signals will become available as more cohorts finish."),
+                variant = "info")
+    } else {
+      # Derive a cohort range string per assessment from all_data — purely a
+      # display column. Each cohort label is shortened "Class of 2026" → "GC26"
+      # and joined with " → " so the table cell reads e.g. "GC23 → GC24 → GC25 → GC26".
+      assess_cohorts <- dplyr::bind_rows(lapply(names(all_data), function(lab) {
+        r <- all_data[[lab]]
+        if (is.null(r$grades_df) || nrow(r$grades_df) == 0) return(NULL)
+        non_final <- setdiff(unique(r$grades_df$assessment),
+                             c("weighted_overall_grade",
+                               "individual_weighted_overall"))
+        if (length(non_final) == 0) return(NULL)
+        data.frame(assessment = non_final, cohort = lab,
+                   stringsAsFactors = FALSE)
+      })) |>
+        dplyr::arrange(.data$cohort) |>
+        dplyr::group_by(.data$assessment) |>
+        dplyr::summarise(`Cohort range` = paste(
+          vapply(unique(.data$cohort), function(c) {
+            paste0("GC", substr(c, nchar(c) - 1, nchar(c)))
+          }, character(1)),
+          collapse = " → "
+        ), .groups = "drop")
+
+      df <- df |> dplyr::left_join(assess_cohorts, by = "assessment")
+
+      # Neutral, observational labels for the direction-of-change signal.
+      df$Signal <- vapply(df$flag, function(f) {
+        switch(f,
+               declining = "Shift down",
+               improving = "Shift up",
+               stable    = "Stable",
+               f)
+      }, character(1))
+
+      dt <- DT::datatable(
+        df |>
+          dplyr::transmute(
+            Assessment      = .data$assessment,
+            `Cohort range`  = .data$`Cohort range`,
+            `First mean`    = .data$first_mean,
+            `Last mean`     = .data$last_mean,
+            Δ               = .data$delta,
+            Signal          = .data$Signal
+          ),
+        rownames = FALSE, escape = FALSE,
+        extensions = "Buttons",
+        options  = list(
+          dom = "Bfrtip", pageLength = 15, scrollX = FALSE,
+          buttons = cvm_dt_buttons("assessment_trends"),
+          columnDefs = list(
+            list(targets = 0, className = "dt-left"),
+            list(targets = 1,   className = "dt-left"),
+            list(targets = 2:5, className = "dt-right")
+          )
         )
+      ) |>
+        DT::formatStyle(
+          "Signal",
+          backgroundColor = DT::styleEqual(
+            c("Shift down", "Shift up", "Stable"),
+            c("#F5F6FA",   "#F5F6FA",  "#F5F6FA"))
+        )
+
+      n_shifted <- sum(abs(df$delta) >= 5, na.rm = TRUE)
+      tagList(
+        if (n_shifted > 0) {
+          ui_banner(paste(
+            "Assessments where mean scores have shifted by more than 5",
+            "points between the earliest and latest cohort. Noted for",
+            "review — changes may reflect curriculum evolution,",
+            "assessment redesign, or cohort differences."
+          ), variant = "info")
+        },
+        dt
       )
-    ) |>
-      DT::formatStyle(
-        "Flag",
-        backgroundColor = DT::styleEqual(
-          c("⚠ declining", "↑ improving", "= stable"),
-          c("#FFEBEE", "#E8F5E9", "#F5F6FA"))
-      )
-    n_declining <- sum(df$flag == "declining")
-    tagList(
-      if (n_declining > 0) {
-        ui_banner(sprintf(
-          "%d assessment%s showing a mean decline of more than 5 points from earliest to latest cohort — investigate.",
-          n_declining, if (n_declining == 1) "" else "s"
-        ), variant = "warn")
-      },
-      dt
-    )
+    }
   }
 
   # ---------- Assemble ----------
@@ -1499,7 +1587,7 @@ if (length(all_data) < 2) {
     # Card 1: Grade trajectory + Delivery-consistency pull-quote side by side.
     tags$div(
       class = "cvm-card", style = cy_card_style,
-      tags$h2(class = "cvm-card-title", "Grade trajectory — cohort over cohort"),
+      tags$h2(class = "cvm-card-title", "Final Grade trajectory — cohort over cohort"),
       tags$p(class = "cvm-card-desc",
              "Share of students at ≥ 80% per cohort, with delta vs the prior cohort; consistency verdict uses the last 3 cohorts."),
       tags$div(
@@ -1508,28 +1596,20 @@ if (length(all_data) < 2) {
         tags$div(consistency_ui)
       )
     ),
-    # Card 2: Student volume trend.
+    # Card 2: Student volume trend (compact table).
     tags$div(
       class = "cvm-card", style = cy_card_style,
       tags$h2(class = "cvm-card-title", "Student volume trend"),
       tags$p(class = "cvm-card-desc",
-             "Number of students assessed in each cohort — tracks enrollment and curriculum reach."),
-      ui_plot_box(volume_bar, height = 380)
+             "Number of students assessed in each cohort and the number of curriculum periods covered."),
+      volume_dt
     ),
-    # Card 3: Tag-coverage signals (two-column grid).
-    tags$div(
-      class = "cvm-card", style = cy_card_style,
-      tags$h2(class = "cvm-card-title", "Tag-coverage signals"),
-      tags$p(class = "cvm-card-desc",
-             "Which tags are reliably covered every year vs. which swing cohort to cohort (potential curriculum gaps)."),
-      tag_cards_ui
-    ),
-    # Card 4: Assessment difficulty signal.
+    # Card 3: Assessment difficulty signal.
     tags$div(
       class = "cvm-card", style = cy_card_style,
       tags$h2(class = "cvm-card-title", "Assessment difficulty signal"),
       tags$p(class = "cvm-card-desc",
-             "Per-assessment mean trend across cohorts — declines > 5 points are flagged for faculty review."),
+             "Per-assessment mean change between earliest and latest cohort. Shifts of more than 5 points are noted for review."),
       assess_ui
     )
   )
@@ -1824,13 +1904,17 @@ pdf_branch <- function() {
     src <- rec$raw_text %||% rec$text %||% ""
     parsed <- parse_likert_rows(src)
 
-    body <- if (is.null(parsed)) {
-      tags$p(
-        style = "margin:0;font-size:13px;color:#5A6472;",
-        sprintf("Survey PDF available — provide structured data at data/survey_responses/%s.csv for detailed analysis.",
-                safe_code_for_csv)
-      )
-    } else {
+    # Narrative fallback: when the PDF is a feedback-report style document
+    # (no Likert rows parse cleanly), parse_survey_pdf() leaves a
+    # `key_findings` entry of type "narrative" with extracted sentences.
+    # Render those as a clean bullet list so the cohort card has content
+    # instead of just an instructional message.
+    narr_q  <- rec$questions[["key_findings"]]
+    is_narr <- !is.null(narr_q) &&
+               identical(narr_q$type %||% NA_character_, "narrative") &&
+               length(narr_q$sentences %||% character(0)) > 0
+
+    body <- if (!is.null(parsed)) {
       DT::datatable(
         parsed, rownames = FALSE, escape = FALSE,
         extensions = "Buttons",
@@ -1854,6 +1938,25 @@ pdf_branch <- function() {
             "}"
           )
         )
+      )
+    } else if (is_narr) {
+      tagList(
+        tags$p(
+          style = "margin:0 0 12px 0;font-size:13px;color:#5A6472;font-style:italic;",
+          "Narrative-format report — key sentences extracted:"
+        ),
+        tags$ul(
+          style = "margin:0;padding-left:20px;font-size:14px;line-height:1.65;color:#1A1A2E;",
+          lapply(as.character(narr_q$sentences), function(s) {
+            tags$li(style = "margin-bottom:8px;", s)
+          })
+        )
+      )
+    } else {
+      tags$p(
+        style = "margin:0;font-size:13px;color:#5A6472;",
+        sprintf("Survey PDF available — provide structured data at data/survey_responses/%s.csv for detailed analysis.",
+                safe_code_for_csv)
       )
     }
 
@@ -2037,14 +2140,19 @@ if (is.null(narrative)) {
         flags_ui
       )
     },
-    if (!is.null(questions_ui)) {
-      tags$div(
-        class = "cvm-card", style = ci_card_style,
-        tags$h2(class = "cvm-card-title", "Questions to explore"),
-        tags$p(class = "cvm-card-desc",
-               "Prompts to carry into the next faculty curriculum-review conversation."),
-        questions_ui
-      )
+    if (FALSE) {  # HIDDEN — Questions to explore
+      # Re-enable by changing FALSE to TRUE.
+      # Server-side guard so the section never reaches the HTML — CSS
+      # display:none was unreliable in some Quarto/bslib layouts.
+      if (!is.null(questions_ui)) {
+        tags$div(
+          class = "cvm-card cvm-questions-explore", style = ci_card_style,
+          tags$h2(class = "cvm-card-title", "Questions to explore"),
+          tags$p(class = "cvm-card-desc",
+                 "Prompts to carry into the next faculty curriculum-review conversation."),
+          questions_ui
+        )
+      }
     },
     tags$p(
       style = "color:#5A6472;font-size:12px;margin:-24px 0 32px 0;padding:0 4px;",
