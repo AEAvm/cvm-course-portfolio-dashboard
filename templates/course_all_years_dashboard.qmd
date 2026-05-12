@@ -1641,8 +1641,14 @@ st_card_style <- paste0(
 )
 
 safe_code_for_csv <- gsub("[^A-Za-z0-9]", "", primary$course_code)
-survey_csv_path <- file.path(proj_root, "data", "survey_responses",
+# CSV location: written by scripts/extract_survey_responses.R into the
+# course's own outputs/ folder so the file ships alongside the rendered
+# dashboard. Same folder Downloads/.render_cache live in — two levels
+# above params$all_data_path.
+course_dir_for_csv <- dirname(dirname(params$all_data_path))
+survey_csv_path <- file.path(course_dir_for_csv, "data", "survey_responses",
                              paste0(safe_code_for_csv, ".csv"))
+survey_csv_rel  <- sub("^.*/outputs/", "outputs/", survey_csv_path)
 
 # Detect whether ANY surveys folder has at least one PDF.
 any_survey_pdfs <- any(vapply(names(all_data), function(lab) {
@@ -1656,28 +1662,27 @@ instructional_block <- tags$div(
   style = "padding:18px 22px;background:#EEF4FB;border-left:4px solid #003F6B;border-radius:8px;color:#003F6B;font-size:14px;line-height:1.6;",
   if (any_survey_pdfs) {
     HTML(paste0(
-      "<strong>Survey data available</strong> — extract question responses ",
-      "to enable trend graphs. ",
-      "Drop a CSV at <code>data/survey_responses/",
-      htmlEscape(safe_code_for_csv), ".csv</code> with columns ",
-      "<code>cohort, question_text, mean_score, n_respondents</code>. ",
-      "See <code>data/survey_responses/README.md</code> for full instructions."
+      "<strong>Survey data available</strong> — run the extraction script ",
+      "to enable structured trend graphs. ",
+      "Expected CSV at <code>", htmlEscape(survey_csv_rel), "</code> with columns ",
+      "<code>cohort, question, response_option, count</code> ",
+      "(produced by <code>scripts/extract_survey_responses.R</code>)."
     ))
   } else {
     HTML(paste0(
       "<strong>Survey trend chart not yet populated.</strong> ",
-      "Drop a CSV at <code>data/survey_responses/",
-      htmlEscape(safe_code_for_csv), ".csv</code> with columns ",
-      "<code>cohort, question_text, mean_score, n_respondents</code> ",
-      "to render a multi-cohort trend chart on this tab. ",
-      "See <code>data/survey_responses/README.md</code> for full instructions."
+      "Run <code>scripts/extract_survey_responses.R</code> to produce ",
+      "<code>", htmlEscape(survey_csv_rel), "</code> with columns ",
+      "<code>cohort, question, response_option, count</code>, ",
+      "then re-render this course to surface a multi-cohort response-distribution chart."
     ))
   }
 )
 
-# If a structured CSV exists for this course, render the trend line chart.
-# Otherwise, fall back to PDF text mining: pdftools-extracted previews +
-# keyword-frequency heatmap across the survey PDFs Ish has dropped in.
+# CSV branch — reads the extraction-script output (one row per
+# cohort × question × response_option, with a `count`). Renders a stacked
+# bar chart of Likert agreement distribution per cohort plus a per-cohort
+# response-volume summary.
 csv_branch <- function() {
   survey_df <- tryCatch(
     readr::read_csv(survey_csv_path, show_col_types = FALSE),
@@ -1686,24 +1691,22 @@ csv_branch <- function() {
       NULL
     }
   )
-  required_cols <- c("cohort", "question_text", "mean_score", "n_respondents")
+  required_cols <- c("cohort", "question", "response_option", "count")
   if (is.null(survey_df) || !all(required_cols %in% names(survey_df))) {
     return(tags$div(
       class = "cvm-card", style = st_card_style,
       tags$h2(class = "cvm-card-title", "Survey Trends"),
       tags$p(class = "cvm-card-desc",
-             "Multi-year mean response per survey question."),
+             "Survey response distribution across cohorts."),
       ui_banner(sprintf(
         "Survey CSV at %s is malformed. Required columns: %s.",
         survey_csv_path, paste(required_cols, collapse = ", ")
       ), variant = "warn")
     ))
   }
-  survey_df$cohort_year <- suppressWarnings(
-    as.integer(sub("^Class of ", "", survey_df$cohort))
-  )
-  survey_df <- survey_df[!is.na(survey_df$cohort_year) &
-                         is.finite(survey_df$mean_score), , drop = FALSE]
+  # Coerce count and drop empty rows
+  survey_df$count <- suppressWarnings(as.integer(survey_df$count))
+  survey_df <- survey_df[!is.na(survey_df$count) & survey_df$count > 0, , drop = FALSE]
   if (nrow(survey_df) == 0) {
     return(tags$div(
       class = "cvm-card", style = st_card_style,
@@ -1712,39 +1715,102 @@ csv_branch <- function() {
                 variant = "warn")
     ))
   }
-  st_plot <- plotly::plot_ly(
-    data = survey_df,
-    x = ~cohort_year, y = ~mean_score,
-    color = ~question_text,
-    type = "scatter", mode = "lines+markers",
-    text = ~paste0("Question: ", question_text,
-                   "<br>Cohort: ", cohort,
-                   "<br>Mean: ", round(mean_score, 2),
-                   "<br>N: ", n_respondents),
-    hoverinfo = "text",
-    height = 460
-  ) |>
+
+  # Likert response ordering + green-to-red palette. Anything outside this
+  # set (free-text responses, N/A markers, etc.) is grouped under "Other"
+  # so the chart total still adds up to the cohort's total response volume.
+  likert_palette <- c(
+    "Strongly Agree"             = "#1B5E20",
+    "Somewhat Agree"             = "#2E7D32",
+    "Agree"                      = "#66BB6A",
+    "Neither Agree nor Disagree" = "#9E9E9E",
+    "Neutral"                    = "#9E9E9E",
+    "Somewhat Disagree"          = "#EF6C00",
+    "Disagree"                   = "#F57C00",
+    "Strongly Disagree"          = "#C62828",
+    "Not Applicable"             = "#CFD8DC",
+    "N/A"                        = "#CFD8DC"
+  )
+  survey_df$response_option <- as.character(survey_df$response_option)
+  survey_df$response_bucket <- ifelse(
+    survey_df$response_option %in% names(likert_palette),
+    survey_df$response_option, "Other"
+  )
+
+  # Aggregate to cohort × response_bucket
+  agg <- survey_df |>
+    dplyr::group_by(.data$cohort, .data$response_bucket) |>
+    dplyr::summarise(count = sum(.data$count, na.rm = TRUE), .groups = "drop")
+
+  # Cohort order (chronological by trailing year)
+  cohort_year <- suppressWarnings(
+    as.integer(sub("^.*([0-9]{4}).*$", "\\1", agg$cohort))
+  )
+  cohort_levels <- unique(agg$cohort[order(cohort_year, agg$cohort)])
+  agg$cohort <- factor(agg$cohort, levels = cohort_levels)
+
+  # Per-cohort total → percentage
+  totals <- stats::setNames(
+    vapply(cohort_levels, function(c) sum(agg$count[agg$cohort == c]), numeric(1)),
+    cohort_levels
+  )
+  agg$pct <- round(100 * agg$count / totals[as.character(agg$cohort)], 1)
+
+  # Stack order: Likert palette order, then "Other" at the bottom
+  resp_levels <- c(intersect(names(likert_palette), unique(agg$response_bucket)),
+                   if ("Other" %in% agg$response_bucket) "Other" else NULL)
+  agg$response_bucket <- factor(agg$response_bucket, levels = resp_levels)
+
+  full_palette <- c(likert_palette, Other = "#B0BEC5")
+
+  # Build stacked bar — one trace per response bucket
+  st_plot <- plotly::plot_ly(height = 460)
+  for (resp in resp_levels) {
+    sub <- agg[agg$response_bucket == resp, , drop = FALSE]
+    st_plot <- st_plot |> plotly::add_trace(
+      x = as.character(sub$cohort),
+      y = sub$count,
+      type = "bar",
+      name = resp,
+      marker = list(color = unname(full_palette[resp])),
+      text = sprintf("%s — %s: %d (%.1f%%)",
+                     sub$cohort, resp, sub$count, sub$pct),
+      hovertemplate = "%{text}<extra></extra>"
+    )
+  }
+  st_plot <- st_plot |>
     plotly::layout(
-      title = list(text = sprintf("Survey question trends — %s",
+      title = list(text = sprintf("Survey response distribution — %s",
                                   primary$course_code),
                    font = list(color = CVM_PALETTE$navy, size = 14)),
-      xaxis = list(title = "Cohort year", gridcolor = "#E4E7EC",
-                   type = "category", automargin = TRUE),
-      yaxis = list(title = "Mean score", gridcolor = "#E4E7EC"),
-      legend = list(orientation = "h", y = -0.3),
+      barmode = "stack",
+      xaxis = list(title = "", type = "category", automargin = TRUE),
+      yaxis = list(title = "Response count", gridcolor = "#E4E7EC"),
+      legend = list(orientation = "h", y = -0.20),
       paper_bgcolor = "white", plot_bgcolor = "white",
       font = list(color = CVM_PALETTE$text, family = "Inter, sans-serif"),
-      margin = list(t = 50, b = 140, l = 60, r = 40),
+      margin = list(t = 50, b = 110, l = 60, r = 40),
       autosize = TRUE
     )
   st_plot <- do.call(plotly::config,
                      c(list(st_plot),
-                       cvm_plotly_config_args(filename_tag = "survey_trends")))
+                       cvm_plotly_config_args(filename_tag = "survey_distribution")))
+
+  # Per-cohort summary line ("Class of 2026: 1,234 responses · …").
+  # fmt_num is scalar-only — vapply across the cohort totals.
+  cohort_summary <- paste(sprintf("%s: %s responses",
+                                  cohort_levels,
+                                  vapply(totals[cohort_levels],
+                                         fmt_num, character(1))),
+                          collapse = " · ")
+
   tags$div(
     class = "cvm-card", style = st_card_style,
     tags$h2(class = "cvm-card-title", "Survey Trends"),
     tags$p(class = "cvm-card-desc",
-           "Mean response per question across cohorts. Hover any line for question text and N."),
+           "Likert response distribution across cohorts. Stacked bars sum to total responses per cohort. Source: structured CSV from scripts/extract_survey_responses.R."),
+    tags$p(style = "font-size:12px;color:#5A6472;margin:0 0 12px 0;font-variant-numeric:tabular-nums;",
+           cohort_summary),
     ui_plot_box(st_plot, height = 480)
   )
 }
