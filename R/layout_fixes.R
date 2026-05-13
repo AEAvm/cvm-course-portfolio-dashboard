@@ -287,6 +287,126 @@ div[style*="minmax(420px"] {
     counts[["css_injected"]] <- 1L
   }
 
+  # ── Dynamic per-tab Table of Contents script — inject before </head> ────
+  # Runs client-side: on DOMContentLoaded and on every Bootstrap "shown.bs.tab"
+  # event, finds the active tab panel, collects all `h2.cvm-card-title` /
+  # `h3.cvm-card-title` headings, assigns stable IDs, and rebuilds the
+  # `#cvm-page-toc` list (rendered as the first child of `.cvm-sidebar`).
+  html_raw <- gsub(
+    "</head>",
+    '<script id="cvm-toc-script">
+(function() {
+  function buildToc() {
+    var toc = document.getElementById("cvm-page-toc");
+    if (!toc) return;
+
+    // Find the active tab panel
+    var activePanel = document.querySelector(
+      ".tab-pane.active, .bslib-tab-pane.active"
+    );
+    if (!activePanel) return;
+
+    // Collect all cvm-card-title headings in the active panel
+    var headings = activePanel.querySelectorAll(
+      "h2.cvm-card-title, h3.cvm-card-title"
+    );
+    if (headings.length === 0) {
+      toc.innerHTML = "";
+      return;
+    }
+
+    // Assign stable anchor IDs to each heading if not already set
+    headings.forEach(function(h, i) {
+      if (!h.id) {
+        h.id = "cvm-section-" + i + "-" +
+          h.textContent.trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-|-$/g, "");
+      }
+    });
+
+    // Build TOC HTML
+    var label = document.createElement("div");
+    label.style.cssText = [
+      "font-size:10px",
+      "text-transform:uppercase",
+      "letter-spacing:0.08em",
+      "color:#C9A84C",
+      "font-weight:700",
+      "margin-bottom:8px",
+      "padding-bottom:4px",
+      "border-bottom:1px solid rgba(255,255,255,0.15)"
+    ].join(";");
+    label.textContent = "On this page";
+
+    var list = document.createElement("ul");
+    list.style.cssText = [
+      "list-style:none",
+      "margin:0",
+      "padding:0"
+    ].join(";");
+
+    headings.forEach(function(h) {
+      var li = document.createElement("li");
+      var a = document.createElement("a");
+      a.href = "#" + h.id;
+      a.textContent = h.textContent.trim();
+      a.style.cssText = [
+        "display:block",
+        "color:#FFFFFF",
+        "font-size:12px",
+        "padding:3px 0 3px 8px",
+        "border-left:2px solid transparent",
+        "text-decoration:none",
+        "line-height:1.4",
+        "transition:border-color 0.15s, color 0.15s"
+      ].join(";");
+      a.addEventListener("mouseenter", function() {
+        this.style.borderLeftColor = "#C9A84C";
+        this.style.color = "#C9A84C";
+      });
+      a.addEventListener("mouseleave", function() {
+        this.style.borderLeftColor = "transparent";
+        this.style.color = "#FFFFFF";
+      });
+      a.addEventListener("click", function(e) {
+        e.preventDefault();
+        var target = document.getElementById(h.id);
+        if (target) {
+          target.scrollIntoView({behavior: "smooth", block: "start"});
+        }
+      });
+      li.appendChild(a);
+      list.appendChild(li);
+    });
+
+    toc.innerHTML = "";
+    toc.appendChild(label);
+    toc.appendChild(list);
+  }
+
+  // Build on tab switch
+  document.addEventListener("shown.bs.tab", function() {
+    setTimeout(buildToc, 150);
+  });
+
+  // Build on first load
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function() {
+      setTimeout(buildToc, 400);
+    });
+  } else {
+    setTimeout(buildToc, 400);
+  }
+})();
+</script>
+</head>',
+    html_raw,
+    fixed = TRUE
+  )
+  counts[["toc_injected"]] <- 1L
+
   # ── Plotly interactivity JS — inject before </body> ─────────────────────
   plotly_js <- '
 <script id="cvm-plotly-unlock">

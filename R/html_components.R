@@ -312,6 +312,12 @@ ui_sidebar <- function(course_code,
       "min-height:100vh;",
       "border-radius:0;"
     ),
+    # Dynamic per-tab table of contents — populated by the cvm-toc-script
+    # block injected into <head> by apply_layout_fixes(). Empty placeholder
+    # at render time; client-side JS fills it on DOMContentLoaded and on
+    # every Bootstrap tab switch.
+    tags$div(id = "cvm-page-toc",
+             style = "margin-bottom:24px;"),
     tags$div(
       style = .css(
         "font-size:20px; font-weight:700;",
