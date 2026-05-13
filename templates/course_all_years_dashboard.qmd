@@ -286,19 +286,46 @@ ui_sidebar(
   ),
   extra_sections = list(
     list(title = "Classes included",
+         li_class = "cvm-cohort-item",
          items = vapply(all_data, function(r) r$cohort_label, character(1))),
     list(title = "Tag sets available",
          items = lapply(seq_along(tag_set_names), function(i) {
            ts <- tag_set_names[[i]]
            pretty <- tag_set_pretty[[i]]
            anchor_id <- paste0("tagset-", tolower(gsub("[^A-Za-z0-9]", "-", ts)))
+           # Always navigate to the Curriculum Tag Coverage tab first
+           # (textContent match) then scroll to the matching section after
+           # 350 ms so Bootstrap has time to swap tab panels. The keyword
+           # match is alphanumeric-only on both sides, so case / spacing /
+           # punctuation in tag-set names is tolerated.
+           onclick_js <- gsub(
+             "{TAG_LABEL}", ts,
+             "(function(){
+  var navLinks = document.querySelectorAll('.quarto-dashboard .navbar-nav .nav-link, .navbar-nav .nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    var txt = navLinks[i].textContent.trim().toLowerCase();
+    if (txt.includes('curriculum') || txt.includes('tag coverage')) {
+      navLinks[i].click();
+      break;
+    }
+  }
+  setTimeout(function(){
+    var anchors = document.querySelectorAll('[id]');
+    var target = null;
+    var keyword = '{TAG_LABEL}'.toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (var j = 0; j < anchors.length; j++) {
+      var id = anchors[j].id.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (id.includes(keyword)) { target = anchors[j]; break; }
+    }
+    if (target) target.scrollIntoView({behavior:'smooth', block:'start'});
+  }, 350);
+})()",
+             fixed = TRUE
+           )
            tags$a(
              href = paste0("#", anchor_id),
              style = "color:#C9A84C; text-decoration:none; cursor:pointer;",
-             onclick = sprintf(
-               "event.preventDefault(); document.getElementById('%s').scrollIntoView({behavior:'smooth', block:'start'}); return false;",
-               anchor_id
-             ),
+             onclick = onclick_js,
              pretty
            )
          }))

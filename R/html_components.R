@@ -277,11 +277,12 @@ ui_sidebar <- function(course_code,
     "border-top:1px solid rgba(255,255,255,0.15);"
   )
 
-  bullet_list <- function(items) {
+  bullet_list <- function(items, li_class = NULL) {
     tags$ul(
       style = "list-style:none; padding-left:0; margin:0;",
       lapply(items, function(t) {
         tags$li(
+          class = li_class,
           style = .css(
             "padding:8px 0 8px 8px;",
             "font-size:13px;",
@@ -312,12 +313,6 @@ ui_sidebar <- function(course_code,
       "min-height:100vh;",
       "border-radius:0;"
     ),
-    # Dynamic per-tab table of contents — populated by the cvm-toc-script
-    # block injected into <head> by apply_layout_fixes(). Empty placeholder
-    # at render time; client-side JS fills it on DOMContentLoaded and on
-    # every Bootstrap tab switch.
-    tags$div(id = "cvm-page-toc",
-             style = "margin-bottom:24px;"),
     tags$div(
       style = .css(
         "font-size:20px; font-weight:700;",
@@ -355,7 +350,7 @@ ui_sidebar <- function(course_code,
       lapply(extra_sections, function(s) {
         tagList(
           tags$div(style = heading_style, s$title),
-          bullet_list(s$items)
+          bullet_list(s$items, li_class = s$li_class %||% NULL)
         )
       })
     }
