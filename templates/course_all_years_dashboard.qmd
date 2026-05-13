@@ -1713,132 +1713,109 @@ instructional_block <- tags$div(
 csv_branch <- function() {
   survey_df <- tryCatch(
     readr::read_csv(survey_csv_path, show_col_types = FALSE),
-    error = function(e) {
-      message(sprintf("survey CSV read failed: %s", conditionMessage(e)))
-      NULL
-    }
+    error = function(e) NULL
   )
   required_cols <- c("cohort", "question", "response_option", "count")
   if (is.null(survey_df) || !all(required_cols %in% names(survey_df))) {
     return(tags$div(
       class = "cvm-card", style = st_card_style,
       tags$h2(class = "cvm-card-title", "Survey Trends"),
-      tags$p(class = "cvm-card-desc",
-             "Survey response distribution across cohorts."),
-      ui_banner(sprintf(
-        "Survey CSV at %s is malformed. Required columns: %s.",
-        survey_csv_path, paste(required_cols, collapse = ", ")
-      ), variant = "warn")
+      ui_banner("Survey CSV not found or malformed.", variant = "warn")
     ))
   }
-  # Coerce count and drop empty rows
-  survey_df$count <- suppressWarnings(as.integer(survey_df$count))
+
+  # Strip version suffix e.g. "Class of 2024 (v3)" -> "Class of 2024"
+  survey_df$cohort <- stringr::str_replace(survey_df$cohort, "\\s*\\(v\\d+\\)\\s*$", "")
+  survey_df$count  <- suppressWarnings(as.integer(survey_df$count))
   survey_df <- survey_df[!is.na(survey_df$count) & survey_df$count > 0, , drop = FALSE]
+
   if (nrow(survey_df) == 0) {
     return(tags$div(
       class = "cvm-card", style = st_card_style,
       tags$h2(class = "cvm-card-title", "Survey Trends"),
-      ui_banner("Survey CSV exists but no parseable rows found.",
-                variant = "warn")
+      ui_banner("Survey CSV has no valid rows.", variant = "warn")
     ))
   }
 
-  # Likert response ordering + green-to-red palette. Anything outside this
-  # set (free-text responses, N/A markers, etc.) is grouped under "Other"
-  # so the chart total still adds up to the cohort's total response volume.
-  likert_palette <- c(
-    "Strongly Agree"             = "#1B5E20",
-    "Somewhat Agree"             = "#2E7D32",
-    "Agree"                      = "#66BB6A",
-    "Neither Agree nor Disagree" = "#9E9E9E",
-    "Neutral"                    = "#9E9E9E",
-    "Somewhat Disagree"          = "#EF6C00",
-    "Disagree"                   = "#F57C00",
-    "Strongly Disagree"          = "#C62828",
-    "Not Applicable"             = "#CFD8DC",
-    "N/A"                        = "#CFD8DC"
-  )
-  survey_df$response_option <- as.character(survey_df$response_option)
-  survey_df$response_bucket <- ifelse(
-    survey_df$response_option %in% names(likert_palette),
-    survey_df$response_option, "Other"
+  # Cohort order
+  cohort_year   <- suppressWarnings(as.integer(sub("^.*([0-9]{4}).*$", "\\1", survey_df$cohort)))
+  cohort_levels <- unique(survey_df$cohort[order(cohort_year, survey_df$cohort)])
+
+  # Classify questions
+  survey_df$q_type <- dplyr::case_when(
+    grepl("strength|well|positive|working|effective|good", survey_df$question, ignore.case = TRUE) ~ "strengths",
+    grepl("improve|weak|concern|challeng|issue|problem|need|area", survey_df$question, ignore.case = TRUE) ~ "improvements",
+    TRUE ~ "other"
   )
 
-  # Aggregate to cohort × response_bucket
-  agg <- survey_df |>
-    dplyr::group_by(.data$cohort, .data$response_bucket) |>
-    dplyr::summarise(count = sum(.data$count, na.rm = TRUE), .groups = "drop")
+  # Drop NA / blank response options — these are unanswered questions,
+  # not meaningful selections
+  survey_df <- survey_df[
+    !is.na(survey_df$response_option) &
+    !grepl("^\\s*NA\\s*$|^\\s*N/A\\s*$|^\\s*$", survey_df$response_option, ignore.case = TRUE),
+    , drop = FALSE
+  ]
 
-  # Cohort order (chronological by trailing year)
-  cohort_year <- suppressWarnings(
-    as.integer(sub("^.*([0-9]{4}).*$", "\\1", agg$cohort))
-  )
-  cohort_levels <- unique(agg$cohort[order(cohort_year, agg$cohort)])
-  agg$cohort <- factor(agg$cohort, levels = cohort_levels)
-
-  # Per-cohort total → percentage
-  totals <- stats::setNames(
-    vapply(cohort_levels, function(c) sum(agg$count[agg$cohort == c]), numeric(1)),
-    cohort_levels
-  )
-  agg$pct <- round(100 * agg$count / totals[as.character(agg$cohort)], 1)
-
-  # Stack order: Likert palette order, then "Other" at the bottom
-  resp_levels <- c(intersect(names(likert_palette), unique(agg$response_bucket)),
-                   if ("Other" %in% agg$response_bucket) "Other" else NULL)
-  agg$response_bucket <- factor(agg$response_bucket, levels = resp_levels)
-
-  full_palette <- c(likert_palette, Other = "#B0BEC5")
-
-  # Build stacked bar — one trace per response bucket
-  st_plot <- plotly::plot_ly(height = 460)
-  for (resp in resp_levels) {
-    sub <- agg[agg$response_bucket == resp, , drop = FALSE]
-    st_plot <- st_plot |> plotly::add_trace(
-      x = as.character(sub$cohort),
-      y = sub$count,
-      type = "bar",
-      name = resp,
-      marker = list(color = unname(full_palette[resp])),
-      text = sprintf("%s — %s: %d (%.1f%%)",
-                     sub$cohort, resp, sub$count, sub$pct),
-      hovertemplate = "%{text}<extra></extra>"
+  make_freq_table <- function(df_sub, accent_color, top_n = 8) {
+    if (nrow(df_sub) == 0) return(NULL)
+    df_top <- df_sub[order(-df_sub$count), ][seq_len(min(top_n, nrow(df_sub))), ]
+    total  <- sum(df_sub$count, na.rm = TRUE)
+    df_top$pct <- round(100 * df_top$count / total, 1)
+    tags$table(
+      style = "width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px;",
+      tags$thead(tags$tr(
+        tags$th(style = "text-align:left;padding:4px 8px;color:#5A6472;font-weight:600;border-bottom:1px solid #EEF1F5;", "Response"),
+        tags$th(style = "text-align:right;padding:4px 8px;color:#5A6472;font-weight:600;border-bottom:1px solid #EEF1F5;width:50px;", "N"),
+        tags$th(style = "text-align:right;padding:4px 8px;color:#5A6472;font-weight:600;border-bottom:1px solid #EEF1F5;width:55px;", "%")
+      )),
+      tags$tbody(lapply(seq_len(nrow(df_top)), function(i) {
+        row <- df_top[i, ]
+        tags$tr(
+          style = if (i %% 2 == 0) "background:#F9FAFB;" else "",
+          tags$td(style = "padding:5px 8px;color:#1A1A2E;", row$response_option),
+          tags$td(style = "padding:5px 8px;text-align:right;color:#1A1A2E;", row$count),
+          tags$td(style = sprintf("padding:5px 8px;text-align:right;color:%s;font-weight:600;", accent_color),
+                  paste0(row$pct, "%"))
+        )
+      }))
     )
   }
-  st_plot <- st_plot |>
-    plotly::layout(
-      title = list(text = sprintf("Survey response distribution — %s",
-                                  primary$course_code),
-                   font = list(color = CVM_PALETTE$navy, size = 14)),
-      barmode = "stack",
-      xaxis = list(title = "", type = "category", automargin = TRUE),
-      yaxis = list(title = "Response count", gridcolor = "#E4E7EC"),
-      legend = list(orientation = "h", y = -0.20),
-      paper_bgcolor = "white", plot_bgcolor = "white",
-      font = list(color = CVM_PALETTE$text, family = "Inter, sans-serif"),
-      margin = list(t = 50, b = 110, l = 60, r = 40),
-      autosize = TRUE
-    )
-  st_plot <- do.call(plotly::config,
-                     c(list(st_plot),
-                       cvm_plotly_config_args(filename_tag = "survey_distribution")))
 
-  # Per-cohort summary line ("Class of 2026: 1,234 responses · …").
-  # fmt_num is scalar-only — vapply across the cohort totals.
-  cohort_summary <- paste(sprintf("%s: %s responses",
-                                  cohort_levels,
-                                  vapply(totals[cohort_levels],
-                                         fmt_num, character(1))),
-                          collapse = " · ")
+  cohort_cards <- lapply(cohort_levels, function(coh) {
+    df_c   <- survey_df[survey_df$cohort == coh, ]
+    str_df <- df_c[df_c$q_type == "strengths", ]
+    imp_df <- df_c[df_c$q_type == "improvements", ]
+    oth_df <- df_c[df_c$q_type == "other", ]
+    dot_col <- cohort_color_for(coh)
+
+    tags$div(
+      style = "margin-bottom:28px;border:1px solid #EEF1F5;border-radius:10px;padding:20px;background:#FFFFFF;",
+      tags$h3(
+        style = "margin:0 0 14px 0;font-size:15px;font-weight:700;color:#1A1A2E;",
+        tags$span(style = sprintf("display:inline-block;width:10px;height:10px;border-radius:50%%;background:%s;margin-right:8px;vertical-align:middle;", dot_col)),
+        coh
+      ),
+      if (nrow(str_df) > 0) tagList(
+        tags$p(style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#2E7D32;font-weight:700;margin:0 0 6px 0;", "Top strengths"),
+        make_freq_table(str_df, "#2E7D32")
+      ),
+      if (nrow(imp_df) > 0) tagList(
+        tags$p(style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#C62828;font-weight:700;margin:14px 0 6px 0;", "Areas for improvement"),
+        make_freq_table(imp_df, "#C62828")
+      ),
+      if (nrow(oth_df) > 0 && nrow(str_df) == 0 && nrow(imp_df) == 0) tagList(
+        tags$p(style = "font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#5A6472;font-weight:700;margin:0 0 6px 0;", "Responses"),
+        make_freq_table(oth_df, "#5A6472")
+      )
+    )
+  })
 
   tags$div(
     class = "cvm-card", style = st_card_style,
     tags$h2(class = "cvm-card-title", "Survey Trends"),
     tags$p(class = "cvm-card-desc",
-           "Likert response distribution across cohorts. Stacked bars sum to total responses per cohort. Source: structured CSV from scripts/extract_survey_responses.R."),
-    tags$p(style = "font-size:12px;color:#5A6472;margin:0 0 12px 0;font-variant-numeric:tabular-nums;",
-           cohort_summary),
-    ui_plot_box(st_plot, height = 480)
+           "End-of-course survey response frequencies by cohort. Top 8 items shown per question type. Source: structured CSV from scripts/extract_survey_responses.R."),
+    do.call(tagList, cohort_cards)
   )
 }
 
